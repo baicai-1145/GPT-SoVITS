@@ -144,6 +144,12 @@ webui_port_subfix = 9871
 
 api_port = 9880
 
+# Qwen3 configuration
+use_qwen3 = os.environ.get("use_qwen3", "False").lower() == "true"
+qwen3_model_name = os.environ.get("qwen3_model_name", "Qwen/Qwen2-7B")
+qwen3_enable_training = os.environ.get("qwen3_enable_training", "False").lower() == "true"
+qwen3_enable_inference = os.environ.get("qwen3_enable_inference", "True").lower() == "true"
+
 
 # Thanks to the contribution of @Karasukaigan and @XXXXRT666
 def get_device_dtype_sm(idx: int) -> tuple[torch.device, torch.dtype, float, float]:
@@ -216,3 +222,9 @@ class Config:
         self.webui_port_subfix = webui_port_subfix
 
         self.api_port = api_port
+        
+        # Qwen3 configuration
+        self.use_qwen3 = use_qwen3
+        self.qwen3_model_name = qwen3_model_name
+        self.qwen3_enable_training = qwen3_enable_training
+        self.qwen3_enable_inference = qwen3_enable_inference

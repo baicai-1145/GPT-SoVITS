@@ -373,7 +373,7 @@ except:
     pass
 
 
-def change_gpt_weights(gpt_path):
+def change_gpt_weights(gpt_path, use_qwen3=False, qwen3_model_name="Qwen/Qwen2-7B"):
     if "！" in gpt_path or "!" in gpt_path:
         gpt_path = name2gpt_path[gpt_path]
     global hz, max_sec, t2s_model, config
@@ -381,7 +381,14 @@ def change_gpt_weights(gpt_path):
     dict_s1 = torch.load(gpt_path, map_location="cpu", weights_only=False)
     config = dict_s1["config"]
     max_sec = config["data"]["max_sec"]
-    t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+    
+    # Add Qwen3 config if requested
+    if use_qwen3:
+        config["use_qwen3"] = True
+        config["qwen3_model_name"] = qwen3_model_name
+        print(f"Using Qwen3 model: {qwen3_model_name}")
+    
+    t2s_model = Text2SemanticLightningModule(config, "****", is_train=False, use_qwen3=use_qwen3)
     t2s_model.load_state_dict(dict_s1["weight"])
     if is_half == True:
         t2s_model = t2s_model.half()
@@ -398,6 +405,14 @@ def change_gpt_weights(gpt_path):
 
 
 change_gpt_weights(gpt_path)
+
+def update_gpt_with_qwen3(gpt_path, use_qwen3, qwen3_model_name):
+    """Update GPT model with Qwen3 settings"""
+    try:
+        change_gpt_weights(gpt_path, use_qwen3, qwen3_model_name)
+        return f"Successfully updated GPT model with Qwen3={use_qwen3}, model={qwen3_model_name}"
+    except Exception as e:
+        return f"Error updating GPT model: {str(e)}"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 
@@ -765,6 +780,8 @@ def get_tts_wav(
     sample_steps=8,
     if_sr=False,
     pause_second=0.3,
+    use_qwen3=False,
+    qwen3_model_name="Qwen/Qwen2-7B",
 ):
     global cache
     if ref_wav_path:
@@ -1158,6 +1175,64 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
             )
             refresh_button = gr.Button(i18n("刷新模型路径"), variant="primary", scale=14)
             refresh_button.click(fn=change_choices, inputs=[], outputs=[SoVITS_dropdown, GPT_dropdown])
+        
+        # Qwen3 configuration section
+        with gr.Row():
+            use_qwen3_checkbox = gr.Checkbox(
+                label=i18n("使用Qwen3增强文本理解") + " (Use Qwen3 for enhanced text understanding)",
+                value=False,
+                interactive=True,
+                info=i18n("启用Qwen3可以提升文本理解能力，但会增加计算资源消耗") + " (Enabling Qwen3 improves text understanding but increases computational cost)"
+            )
+            qwen3_model_dropdown = gr.Dropdown(
+                label=i18n("Qwen3模型选择") + " (Qwen3 Model)",
+                choices=["Qwen/Qwen2-7B", "Qwen/Qwen2-1.5B", "Qwen/Qwen2-0.5B"],
+                value="Qwen/Qwen2-7B",
+                interactive=True,
+                visible=False,
+                info=i18n("选择Qwen3模型大小，较小模型速度更快") + " (Choose Qwen3 model size, smaller models are faster)"
+            )
+        
+        def toggle_qwen3_visibility(use_qwen3):
+            return gr.update(visible=use_qwen3)
+        
+        def update_model_on_qwen3_change(use_qwen3, qwen3_model_name, current_gpt_path):
+            """Update the model when Qwen3 settings change"""
+            try:
+                change_gpt_weights(current_gpt_path, use_qwen3, qwen3_model_name)
+                status = f"✓ 模型已更新 - Qwen3: {'启用' if use_qwen3 else '禁用'}"
+                if use_qwen3:
+                    status += f" ({qwen3_model_name})"
+                return status
+            except Exception as e:
+                return f"❌ 更新失败: {str(e)}"
+        
+        use_qwen3_checkbox.change(
+            fn=toggle_qwen3_visibility,
+            inputs=[use_qwen3_checkbox],
+            outputs=[qwen3_model_dropdown]
+        )
+        
+        # Add status display for Qwen3 updates
+        qwen3_status = gr.Textbox(
+            label="Qwen3状态 (Qwen3 Status)",
+            value="未使用Qwen3 (Qwen3 not enabled)",
+            interactive=False,
+            visible=True
+        )
+        
+        # Update model when Qwen3 settings change
+        use_qwen3_checkbox.change(
+            fn=update_model_on_qwen3_change,
+            inputs=[use_qwen3_checkbox, qwen3_model_dropdown, GPT_dropdown],
+            outputs=[qwen3_status]
+        )
+        
+        qwen3_model_dropdown.change(
+            fn=update_model_on_qwen3_change,
+            inputs=[use_qwen3_checkbox, qwen3_model_dropdown, GPT_dropdown],
+            outputs=[qwen3_status]
+        )
         gr.Markdown(html_center(i18n("*请上传并填写参考信息"), "h3"))
         with gr.Row():
             inp_ref = gr.Audio(label=i18n("请上传3~10秒内参考音频，超过会报错！"), type="filepath", scale=13)
@@ -1305,6 +1380,8 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                 sample_steps,
                 if_sr_Checkbox,
                 pause_second_slider,
+                use_qwen3_checkbox,
+                qwen3_model_dropdown,
             ],
             [output],
         )
