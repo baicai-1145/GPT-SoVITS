@@ -326,6 +326,12 @@ class TTS_Config:
         self.cnhuhbert_base_path = self.configs.get("cnhuhbert_base_path", None)
         self.languages = self.v1_languages if self.version == "v1" else self.v2_languages
 
+        # Qwen3 configuration
+        self.use_qwen3 = self.configs.get("use_qwen3", False)
+        self.qwen3_model_name = self.configs.get("qwen3_model_name", "Qwen/Qwen2-7B")
+        self.qwen3_enable_training = self.configs.get("qwen3_enable_training", False)
+        self.qwen3_enable_inference = self.configs.get("qwen3_enable_inference", True)
+
         self.use_vocoder: bool = False
 
         if (self.t2s_weights_path in [None, ""]) or (not os.path.exists(self.t2s_weights_path)):
@@ -456,7 +462,7 @@ class TTS:
     def _init_models(
         self,
     ):
-        self.init_t2s_weights(self.configs.t2s_weights_path)
+        self.init_t2s_weights(self.configs.t2s_weights_path, use_qwen3=self.configs.use_qwen3)
         self.init_vits_weights(self.configs.vits_weights_path)
         self.init_bert_weights(self.configs.bert_base_path)
         self.init_cnhuhbert_weights(self.configs.cnhuhbert_base_path)
@@ -576,7 +582,7 @@ class TTS:
         if self.configs.is_half and str(self.configs.device) != "cpu":
             self.vits_model = self.vits_model.half()
 
-    def init_t2s_weights(self, weights_path: str):
+    def init_t2s_weights(self, weights_path: str, use_qwen3=False):
         print(f"Loading Text2Semantic weights from {weights_path}")
         self.configs.t2s_weights_path = weights_path
         self.configs.save_configs()
@@ -584,7 +590,13 @@ class TTS:
         dict_s1 = torch.load(weights_path, map_location=self.configs.device, weights_only=False)
         config = dict_s1["config"]
         self.configs.max_sec = config["data"]["max_sec"]
-        t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+        
+        # Add Qwen3 config if requested
+        if use_qwen3:
+            config["use_qwen3"] = True
+            config["qwen3_model_name"] = getattr(self.configs, "qwen3_model_name", "Qwen/Qwen2-7B")
+        
+        t2s_model = Text2SemanticLightningModule(config, "****", is_train=False, use_qwen3=use_qwen3)
         t2s_model.load_state_dict(dict_s1["weight"])
         t2s_model = t2s_model.to(self.configs.device)
         t2s_model = t2s_model.eval()

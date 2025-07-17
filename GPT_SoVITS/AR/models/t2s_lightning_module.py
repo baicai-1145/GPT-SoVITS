@@ -14,13 +14,33 @@ from AR.models.t2s_model import Text2SemanticDecoder
 from AR.modules.lr_schedulers import WarmupCosineLRSchedule
 from AR.modules.optim import ScaledAdam
 
+# Import Qwen3 model for optional use
+try:
+    from AR.models.qwen3_t2s_model import Qwen3Text2SemanticDecoder
+    QWEN3_AVAILABLE = True
+except ImportError:
+    QWEN3_AVAILABLE = False
+    print("Qwen3 model not available, using original AR model only")
+
 
 class Text2SemanticLightningModule(LightningModule):
-    def __init__(self, config, output_dir, is_train=True):
+    def __init__(self, config, output_dir, is_train=True, use_qwen3=False):
         super().__init__()
         self.config = config
         self.top_k = 3
-        self.model = Text2SemanticDecoder(config=config, top_k=self.top_k)
+        self.use_qwen3 = use_qwen3 and QWEN3_AVAILABLE
+        
+        if self.use_qwen3:
+            print("Using Qwen3Text2SemanticDecoder")
+            qwen_model_name = config.get("qwen3_model_name", "Qwen/Qwen2-7B")
+            self.model = Qwen3Text2SemanticDecoder(
+                config=config, 
+                qwen_model_name=qwen_model_name,
+                top_k=self.top_k
+            )
+        else:
+            print("Using original Text2SemanticDecoder")
+            self.model = Text2SemanticDecoder(config=config, top_k=self.top_k)
         pretrained_s1 = config.get("pretrained_s1")
         if pretrained_s1 and is_train:
             # print(self.load_state_dict(torch.load(pretrained_s1,map_location="cpu")["state_dict"]))

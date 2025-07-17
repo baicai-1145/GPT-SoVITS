@@ -19,6 +19,8 @@ torchaudio
 modelscope==1.10.0
 sentencepiece
 transformers>=4.43,<=4.50
+# Qwen3 support
+qwen-vl
 peft
 chardet
 PyYAML
