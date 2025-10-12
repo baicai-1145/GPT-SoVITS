@@ -1118,41 +1118,8 @@ def get_tts_wav(
                         if cur is not None and (cur["end_s"] - cur["start_s"]) >= min_dur_s:
                             merged.append(cur)
                     char_spans = sorted(merged, key=lambda x: x["start_s"])    
-                    def _build_norm_to_orig_map(orig, norm):
-                        all_punc_local = set(punctuation).union(set(splits))
-                        mapping = [-1] * len(norm)
-                        o = 0
-                        n = 0
-                        while n < len(norm) and o < len(orig):
-                            if norm[n] == orig[o]:
-                                mapping[n] = o
-                                n += 1
-                                o += 1
-                            else:
-                                if orig[o].isspace() or orig[o] in all_punc_local:
-                                    o += 1
-                                elif norm[n].isspace() or norm[n] in all_punc_local:
-                                    n += 1
-                                else:
-                                    n += 1
-                        return mapping
-                    norm2orig = _build_norm_to_orig_map(text, norm_text_seg)
-                    all_punc_local = set(punctuation).union(set(splits))
-                    remapped = []
-                    for cs in char_spans:
-                        ci = cs["char_index"]
-                        ch_norm = cs.get("char", "")
-                        oi = norm2orig[ci] if ci < len(norm2orig) else -1
-                        if oi != -1:
-                            cs["char"] = text[oi]
-                            remapped.append(cs)
-                        else:
-                            if ch_norm and (ch_norm in all_punc_local or ch_norm.isspace()):
-                                continue
-                            remapped.append(cs)
-                    char_spans = remapped
-
-                # word spans (for en/ko parts only)
+                    
+    # word spans (for en/ko parts only)
                 word_spans = []
                 if ph_spans and ph_to_word_map and len(ph_to_word_map) >= 1:
                     for span in ph_spans:
