@@ -19,6 +19,11 @@ special = [
 
 
 def clean_text(text, language, version=None):
+    """
+    Clean and normalize text, returning phones, word2ph, normalized text, and char mapping.
+    Returns: (phones, word2ph, norm_text, char_map)
+    char_map[i] = original position for norm_text[i]
+    """
     if version is None:
         version = os.environ.get("version", "v2")
     if version == "v1":
@@ -33,12 +38,25 @@ def clean_text(text, language, version=None):
         text = " "
     for special_s, special_l, target_symbol in special:
         if special_s in text and language == special_l:
-            return clean_special(text, language, special_s, target_symbol, version)
+            result = clean_special(text, language, special_s, target_symbol, version)
+            # clean_special returns (phones, word2ph, norm_text) - add empty char_map
+            return result + ([],)  # Add empty char_map for special case
+
     language_module = __import__("text." + language_module_map[language], fromlist=[language_module_map[language]])
+
+    # Get normalized text and character mapping
     if hasattr(language_module, "text_normalize"):
-        norm_text = language_module.text_normalize(text)
+        normalize_result = language_module.text_normalize(text)
+        if isinstance(normalize_result, tuple) and len(normalize_result) == 2:
+            # New format: (norm_text, char_map)
+            norm_text, char_map = normalize_result
+        else:
+            # Old format (should not happen after our changes, but keep for safety)
+            norm_text = normalize_result
+            char_map = list(range(len(norm_text)))  # 1:1 mapping as fallback
     else:
         norm_text = text
+        char_map = list(range(len(text)))  # 1:1 mapping
 
     if language == "zh" or language == "yue":  ##########
         phones, word2ph = language_module.g2p(norm_text)
@@ -58,7 +76,7 @@ def clean_text(text, language, version=None):
         if language == "en" and len(phones) < 4:
             phones = [","] + phones
     phones = ["UNK" if ph not in symbols else ph for ph in phones]
-    return phones, word2ph, norm_text
+    return phones, word2ph, norm_text, char_map
 
 
 def clean_special(text, language, special_s, target_symbol, version=None):

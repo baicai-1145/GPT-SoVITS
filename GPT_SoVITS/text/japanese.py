@@ -172,11 +172,35 @@ def preprocess_jap(text, with_prosody=False):
 
 
 def text_normalize(text):
-    # todo: jap text normalize
+    """
+    Normalize Japanese text and return character-level mapping.
+    Returns: (normalized_text, char_map)
+    For Japanese, normalization is minimal - mainly consecutive punctuation removal
+    """
+    original_text = text
 
-    # 避免重复标点引起的参考泄露
-    text = replace_consecutive_punctuation(text)
-    return text
+    # Japanese text_normalize only removes consecutive punctuation
+    text_final = replace_consecutive_punctuation(text)
+
+    # Build mapping
+    if text_final != text:
+        char_map = []
+        orig_idx = 0
+        for i_final in range(len(text_final)):
+            if orig_idx < len(text):
+                char_map.append(orig_idx)
+                orig_idx += 1
+                # Skip consecutive punctuations in original
+                while (orig_idx < len(text) and
+                       i_final + 1 < len(text_final) and
+                       text[orig_idx] in punctuation and
+                       text_final[i_final] in punctuation):
+                    orig_idx += 1
+    else:
+        # No change - direct 1:1 mapping
+        char_map = list(range(len(text)))
+
+    return text_final, char_map
 
 
 # Copied from espnet https://github.com/espnet/espnet/blob/master/espnet2/text/phoneme_tokenizer.py

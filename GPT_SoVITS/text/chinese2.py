@@ -314,16 +314,77 @@ def replace_consecutive_punctuation(text):
 
 
 def text_normalize(text):
-    # https://github.com/PaddlePaddle/PaddleSpeech/tree/develop/paddlespeech/t2s/frontend/zh_normalization
+    """
+    Normalize Chinese text and return character-level mapping.
+    Returns: (normalized_text, char_map)
+    char_map[i] = original position for normalized_text[i]
+    """
+    original_text = text
+
+    # Step 1: TextNormalizer (handles numbers, symbols, etc.)
     tx = TextNormalizer()
     sentences = tx.normalize(text)
-    dest_text = ""
-    for sentence in sentences:
-        dest_text += replace_punctuation(sentence)
+    text_after_norm = "".join(sentences)
 
-    # 避免重复标点引起的参考泄露
-    dest_text = replace_consecutive_punctuation(dest_text)
-    return dest_text
+    # Build mapping for TextNormalizer output
+    # This is approximate - TextNormalizer can expand text significantly
+    map_step1 = []
+    orig_idx = 0
+    norm_idx = 0
+
+    while norm_idx < len(text_after_norm) and orig_idx < len(text):
+        if text_after_norm[norm_idx] == text[orig_idx]:
+            # Direct match
+            map_step1.append(orig_idx)
+            norm_idx += 1
+            orig_idx += 1
+        elif orig_idx < len(text) and (text[orig_idx].isspace() or text[orig_idx] in punctuation):
+            # Skip punctuation/space in original
+            orig_idx += 1
+        else:
+            # Expansion occurred (e.g., "3" -> "三")
+            # Map all expanded chars to current source position
+            source_pos = orig_idx
+            orig_idx += 1
+            # Continue adding expanded chars until we find a match
+            while norm_idx < len(text_after_norm) and (orig_idx >= len(text) or text_after_norm[norm_idx] != text[orig_idx]):
+                map_step1.append(source_pos)
+                norm_idx += 1
+
+    # Handle remaining normalized text
+    while norm_idx < len(text_after_norm):
+        map_step1.append(len(text) - 1 if len(text) > 0 else 0)
+        norm_idx += 1
+
+    # Step 2: Replace punctuation
+    text_after_punc = ""
+    map_step2 = []
+    for i, ch in enumerate(text_after_norm):
+        new_ch = replace_punctuation(ch)
+        for _ in new_ch:
+            text_after_punc += _
+            map_step2.append(map_step1[i] if i < len(map_step1) else -1)
+
+    # Step 3: Replace consecutive punctuation
+    text_final = replace_consecutive_punctuation(text_after_punc)
+    map_final = []
+
+    if text_final != text_after_punc:
+        punc_idx = 0
+        for i_final in range(len(text_final)):
+            if punc_idx < len(text_after_punc):
+                map_final.append(map_step2[punc_idx] if punc_idx < len(map_step2) else -1)
+                punc_idx += 1
+                # Skip consecutive punctuation in source
+                while (punc_idx < len(text_after_punc) and
+                       i_final + 1 < len(text_final) and
+                       text_after_punc[punc_idx] in punctuation and
+                       text_final[i_final] in punctuation):
+                    punc_idx += 1
+    else:
+        map_final = map_step2
+
+    return text_final, map_final
 
 
 if __name__ == "__main__":

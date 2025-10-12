@@ -321,6 +321,17 @@ def post_replace_ph(ph):
     return ph
 
 
+def text_normalize(text):
+    """
+    Korean doesn't have explicit text normalization in original code.
+    Just return text with 1:1 mapping for compatibility.
+    Returns: (text, char_map)
+    """
+    # Direct 1:1 mapping - no normalization for Korean
+    char_map = list(range(len(text)))
+    return text, char_map
+
+
 def g2p(text):
     text = latin_to_hangul(text)
     text = _g2p(text)

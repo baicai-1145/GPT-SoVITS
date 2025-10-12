@@ -9,7 +9,6 @@ from text.symbols import punctuation
 from text.symbols2 import symbols
 
 from builtins import str as unicode
-from text.en_normalization.expend import normalize
 from nltk.tokenize import TweetTokenizer
 
 word_tokenize = TweetTokenizer().tokenize
@@ -231,18 +230,89 @@ def get_namedict():
 
 
 def text_normalize(text):
-    # todo: eng text normalize
+    """
+    Normalize English text and return character-level mapping.
+    Returns: (normalized_text, char_map)
+    char_map[i] = original position for normalized_text[i]
 
-    # 效果相同，和 chinese.py 保持一致
-    pattern = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
-    text = pattern.sub(lambda x: rep_map[x.group()], text)
+    This version uses accurate step-by-step tracking through all normalization stages.
+    """
+    from GPT_SoVITS.text.en_normalization.expend_with_map import normalize_with_map
 
-    text = unicode(text)
-    text = normalize(text)
+    # Step 1: Apply rep_map replacements with tracking
+    text_step1 = text
+    map_step1 = list(range(len(text)))
 
-    # 避免重复标点引起的参考泄露
-    text = replace_consecutive_punctuation(text)
-    return text
+    for pattern_str, replacement in rep_map.items():
+        new_text = []
+        new_map = []
+        pos = 0
+        while pos < len(text_step1):
+            if text_step1[pos:pos + len(pattern_str)] == pattern_str:
+                # Found match - replace and map all replacement chars to source position
+                source_pos = map_step1[pos]
+                for _ in replacement:
+                    new_text.append(_)
+                    new_map.append(source_pos)
+                pos += len(pattern_str)
+            else:
+                new_text.append(text_step1[pos])
+                new_map.append(map_step1[pos])
+                pos += 1
+        text_step1 = ''.join(new_text)
+        map_step1 = new_map
+
+    # Step 2: Apply unicode conversion (should not change length for English)
+    text_step1 = unicode(text_step1)
+
+    # Step 3: Apply normalize() with mapping
+    text_step2, map_step2_temp = normalize_with_map(text_step1)
+
+    # Remap through step1's mapping
+    map_step2 = []
+    for idx in map_step2_temp:
+        if idx < len(map_step1):
+            map_step2.append(map_step1[idx])
+        else:
+            map_step2.append(map_step1[-1] if map_step1 else 0)
+
+    # Step 4: Replace consecutive punctuation
+    text_final = replace_consecutive_punctuation(text_step2)
+
+    if text_final == text_step2:
+        # No change
+        map_final = map_step2
+    else:
+        # Build mapping for consecutive punctuation removal
+        # This removes consecutive punctuation, keeping only the first
+        map_final = []
+        i = 0
+        while i < len(text_step2):
+            char = text_step2[i]
+            if char in punctuation:
+                # This is punctuation - add it
+                map_final.append(map_step2[i] if i < len(map_step2) else 0)
+                # Skip consecutive punctuation
+                j = i + 1
+                while j < len(text_step2) and text_step2[j] in punctuation:
+                    j += 1
+                i = j
+            elif i < len(text_final):
+                # Regular character
+                # Find corresponding position in text_final
+                final_pos = len(map_final)
+                if final_pos < len(text_final) and text_final[final_pos] == text_step2[i]:
+                    map_final.append(map_step2[i] if i < len(map_step2) else 0)
+                i += 1
+            else:
+                i += 1
+
+        # Ensure map_final has correct length
+        while len(map_final) < len(text_final):
+            map_final.append(map_step2[-1] if map_step2 else 0)
+        map_final = map_final[:len(text_final)]
+
+    return text_final, map_final
 
 
 class en_G2p(G2p):
