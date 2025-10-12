@@ -328,7 +328,7 @@ def text_normalize(text):
     Returns: (text, char_map)
     """
     # Direct 1:1 mapping - no normalization for Korean
-    char_map = list(range(len(text)))
+    char_map = [(i, i + 1) for i in range(len(text))]
     return text, char_map
 
 

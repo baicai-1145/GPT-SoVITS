@@ -124,7 +124,7 @@ def text_normalize(text):
     while norm_idx < len(text_after_norm) and orig_idx < len(text):
         if text_after_norm[norm_idx] == text[orig_idx]:
             # Direct match
-            map_step1.append(orig_idx)
+            map_step1.append((orig_idx, min(orig_idx + 1, len(text))))
             norm_idx += 1
             orig_idx += 1
         elif orig_idx < len(text) and (text[orig_idx].isspace() or text[orig_idx] in punctuation):
@@ -136,12 +136,15 @@ def text_normalize(text):
             orig_idx += 1
             # Continue adding expanded chars until we find a match
             while norm_idx < len(text_after_norm) and (orig_idx >= len(text) or text_after_norm[norm_idx] != text[orig_idx]):
-                map_step1.append(source_pos)
+                map_step1.append((source_pos, min(source_pos + 1, len(text))))
                 norm_idx += 1
 
     # Handle remaining normalized text
     while norm_idx < len(text_after_norm):
-        map_step1.append(len(text) - 1 if len(text) > 0 else 0)
+        if len(text) > 0:
+            map_step1.append((len(text) - 1, len(text)))
+        else:
+            map_step1.append((0, 0))
         norm_idx += 1
 
     # Step 2: Replace punctuation
@@ -151,7 +154,10 @@ def text_normalize(text):
         new_ch = replace_punctuation(ch)
         for _ in new_ch:
             text_final += _
-            map_final.append(map_step1[i] if i < len(map_step1) else -1)
+            if i < len(map_step1):
+                map_final.append(map_step1[i])
+            else:
+                map_final.append((-1, -1))
 
     return text_final, map_final
 

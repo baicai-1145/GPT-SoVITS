@@ -3,8 +3,8 @@
 
 from __future__ import print_function
 import re
-import inflect
 import unicodedata
+from typing import Callable, Iterable, List, Sequence, Tuple
 
 # Import all the patterns and maps from original expend.py
 from .expend import (
@@ -34,41 +34,66 @@ from .expend import (
     _expand_number,
 )
 
+Span = Tuple[int, int]
 
-def apply_regex_with_map(pattern, replacement_func, text, char_map):
-    """
-    Apply regex substitution while tracking character mapping.
 
-    Args:
-        pattern: Compiled regex pattern
-        replacement_func: Function that takes match object and returns replacement string
-        text: Current text
-        char_map: Current mapping list where char_map[i] = original position for text[i]
+def _safe_get_span(char_map: Sequence[Span], idx: int) -> Span:
+    if not char_map:
+        return (0, 0)
+    if -len(char_map) <= idx < len(char_map):
+        return char_map[idx]
+    return char_map[-1]
 
-    Returns:
-        (new_text, new_char_map)
-    """
-    new_text = []
-    new_map = []
+
+def _span_from_range(char_spans: Sequence[Span], start: int, end: int) -> Span:
+    """Resolve an inclusive span [start, end) in the current text back to original indices."""
+    if not char_spans:
+        return (0, 0)
+
+    if start < len(char_spans):
+        orig_start = char_spans[start][0]
+    else:
+        orig_start = char_spans[-1][1]
+
+    if end <= 0:
+        orig_end = orig_start
+    elif end - 1 < len(char_spans):
+        orig_end = char_spans[end - 1][1]
+    else:
+        orig_end = char_spans[-1][1]
+
+    if orig_end < orig_start:
+        orig_end = orig_start
+    return (orig_start, orig_end)
+
+
+def apply_regex_with_map(
+    pattern: re.Pattern,
+    replacement_func: Callable[[re.Match], str],
+    text: str,
+    char_map: Sequence[Span],
+) -> Tuple[str, List[Span]]:
+    """Apply regex substitution while tracking span mapping."""
+    new_text: List[str] = []
+    new_map: List[Span] = []
     pos = 0
 
     for match in pattern.finditer(text):
-        # Add text before match (unchanged)
+        # Add unchanged prefix
         for i in range(pos, match.start()):
             new_text.append(text[i])
             new_map.append(char_map[i])
 
-        # Add replacement text - all chars map to start of original match
         replacement = replacement_func(match)
-        source_pos = char_map[match.start()] if match.start() < len(char_map) else (char_map[-1] if char_map else 0)
+        source_span = _span_from_range(char_map, match.start(), match.end())
 
         for char in replacement:
             new_text.append(char)
-            new_map.append(source_pos)
+            new_map.append(source_span)
 
         pos = match.end()
 
-    # Add remaining text
+    # Remainder
     for i in range(pos, len(text)):
         new_text.append(text[i])
         new_map.append(char_map[i])
@@ -76,40 +101,21 @@ def apply_regex_with_map(pattern, replacement_func, text, char_map):
     return ''.join(new_text), new_map
 
 
-def apply_simple_sub_with_map(pattern, replacement, text, char_map):
-    """
-    Apply simple string substitution while tracking character mapping.
+def apply_simple_sub_with_map(pattern, replacement: str, text: str, char_map: Sequence[Span]) -> Tuple[str, List[Span]]:
+    """Apply simple substitution (string or regex) while tracking spans."""
+    compiled = re.compile(re.escape(pattern)) if isinstance(pattern, str) else pattern
 
-    Args:
-        pattern: String or regex pattern to match
-        replacement: Replacement string
-        text: Current text
-        char_map: Current mapping list
-
-    Returns:
-        (new_text, new_char_map)
-    """
-    if isinstance(pattern, str):
-        pattern = re.compile(re.escape(pattern))
-
-    def replace_func(m):
+    def replace_func(_: re.Match) -> str:
         return replacement
 
-    return apply_regex_with_map(pattern, replace_func, text, char_map)
+    return apply_regex_with_map(compiled, replace_func, text, char_map)
 
 
-def normalize_with_map(text):
-    """
-    Normalize English text and return character-level mapping.
-
-    Returns:
-        (normalized_text, char_map)
-        where char_map[i] = original position for normalized_text[i]
-    """
-    original_text = text
+def normalize_with_map(text: str) -> Tuple[str, List[Span]]:
+    """Normalize English text and return mapping spans."""
 
     # Initialize mapping: 1:1 at start
-    char_map = list(range(len(text)))
+    char_map: List[Span] = [(idx, idx + 1) for idx in range(len(text))]
 
     # Step 1: Ordinal number conversion
     text, char_map = apply_regex_with_map(_ordinal_number_re, _convert_ordinal, text, char_map)
@@ -151,13 +157,13 @@ def normalize_with_map(text):
     # Step 14: Unicode normalization (NFD + strip accents)
     # This is tricky - we need to handle character deletions
     new_text = []
-    new_map = []
+    new_map: List[Span] = []
     for i, char in enumerate(text):
         normalized = unicodedata.normalize("NFD", char)
         for nc in normalized:
             if unicodedata.category(nc) != "Mn":  # Not a combining mark
                 new_text.append(nc)
-                new_map.append(char_map[i] if i < len(char_map) else 0)
+                new_map.append(_safe_get_span(char_map, i))
     text = ''.join(new_text)
     char_map = new_map
 
@@ -168,11 +174,11 @@ def normalize_with_map(text):
     # Pattern: [^ A-Za-z'.,?!\-]
     allowed_chars = set(" ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.,?!-")
     new_text = []
-    new_map = []
+    new_map: List[Span] = []
     for i, char in enumerate(text):
         if char in allowed_chars:
             new_text.append(char)
-            new_map.append(char_map[i] if i < len(char_map) else 0)
+            new_map.append(_safe_get_span(char_map, i))
     text = ''.join(new_text)
     char_map = new_map
 
@@ -193,7 +199,7 @@ def normalize_with_map(text):
     # Special handling: the inserted space should map to the previous character
     pattern_uppercase = re.compile(r"(?<!^)(?<![\s])([A-Z])")
     new_text = []
-    new_map = []
+    new_map: List[Span] = []
     pos = 0
 
     for match in pattern_uppercase.finditer(text):
@@ -203,13 +209,13 @@ def normalize_with_map(text):
             new_map.append(char_map[i])
 
         # Add space - map to previous character position
-        prev_pos = char_map[match.start() - 1] if match.start() > 0 else char_map[0]
+        prev_pos = _safe_get_span(char_map, match.start() - 1 if match.start() > 0 else 0)
         new_text.append(" ")
         new_map.append(prev_pos)
 
         # Add the uppercase letter - map to itself
         new_text.append(match.group(1))
-        new_map.append(char_map[match.start()])
+        new_map.append(_safe_get_span(char_map, match.start()))
 
         pos = match.end()
 

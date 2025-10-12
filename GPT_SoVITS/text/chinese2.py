@@ -313,6 +313,25 @@ def replace_consecutive_punctuation(text):
     return result
 
 
+def collapse_consecutive_punctuation_with_map(text: str, span_map):
+    if not text:
+        return text, list(span_map)
+
+    new_text = []
+    new_map = []
+    last_is_punc = False
+
+    for ch, span in zip(text, span_map):
+        is_punc = ch in punctuation
+        if is_punc and last_is_punc:
+            continue
+        new_text.append(ch)
+        new_map.append(span)
+        last_is_punc = is_punc
+
+    return ''.join(new_text), new_map
+
+
 def text_normalize(text):
     """
     Normalize Chinese text and return character-level mapping.
@@ -335,7 +354,7 @@ def text_normalize(text):
     while norm_idx < len(text_after_norm) and orig_idx < len(text):
         if text_after_norm[norm_idx] == text[orig_idx]:
             # Direct match
-            map_step1.append(orig_idx)
+            map_step1.append((orig_idx, min(orig_idx + 1, len(text))))
             norm_idx += 1
             orig_idx += 1
         elif orig_idx < len(text) and (text[orig_idx].isspace() or text[orig_idx] in punctuation):
@@ -348,12 +367,15 @@ def text_normalize(text):
             orig_idx += 1
             # Continue adding expanded chars until we find a match
             while norm_idx < len(text_after_norm) and (orig_idx >= len(text) or text_after_norm[norm_idx] != text[orig_idx]):
-                map_step1.append(source_pos)
+                map_step1.append((source_pos, min(source_pos + 1, len(text))))
                 norm_idx += 1
 
     # Handle remaining normalized text
     while norm_idx < len(text_after_norm):
-        map_step1.append(len(text) - 1 if len(text) > 0 else 0)
+        if len(text) > 0:
+            map_step1.append((len(text) - 1, len(text)))
+        else:
+            map_step1.append((0, 0))
         norm_idx += 1
 
     # Step 2: Replace punctuation
@@ -363,26 +385,13 @@ def text_normalize(text):
         new_ch = replace_punctuation(ch)
         for _ in new_ch:
             text_after_punc += _
-            map_step2.append(map_step1[i] if i < len(map_step1) else -1)
+            if i < len(map_step1):
+                map_step2.append(map_step1[i])
+            else:
+                map_step2.append((-1, -1))
 
     # Step 3: Replace consecutive punctuation
-    text_final = replace_consecutive_punctuation(text_after_punc)
-    map_final = []
-
-    if text_final != text_after_punc:
-        punc_idx = 0
-        for i_final in range(len(text_final)):
-            if punc_idx < len(text_after_punc):
-                map_final.append(map_step2[punc_idx] if punc_idx < len(map_step2) else -1)
-                punc_idx += 1
-                # Skip consecutive punctuation in source
-                while (punc_idx < len(text_after_punc) and
-                       i_final + 1 < len(text_final) and
-                       text_after_punc[punc_idx] in punctuation and
-                       text_final[i_final] in punctuation):
-                    punc_idx += 1
-    else:
-        map_final = map_step2
+    text_final, map_final = collapse_consecutive_punctuation_with_map(text_after_punc, map_step2)
 
     return text_final, map_final
 

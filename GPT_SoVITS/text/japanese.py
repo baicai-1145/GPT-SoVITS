@@ -188,7 +188,7 @@ def text_normalize(text):
         orig_idx = 0
         for i_final in range(len(text_final)):
             if orig_idx < len(text):
-                char_map.append(orig_idx)
+                char_map.append((orig_idx, min(orig_idx + 1, len(text))))
                 orig_idx += 1
                 # Skip consecutive punctuations in original
                 while (orig_idx < len(text) and
@@ -198,7 +198,7 @@ def text_normalize(text):
                     orig_idx += 1
     else:
         # No change - direct 1:1 mapping
-        char_map = list(range(len(text)))
+        char_map = [(i, i + 1) for i in range(len(text))]
 
     return text_final, char_map
 

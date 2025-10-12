@@ -174,7 +174,7 @@ class TextPreprocessor:
             norm_text_list = []
             for i in range(len(textlist)):
                 lang = langlist[i]
-                phones, word2ph, norm_text = self.clean_text_inf(textlist[i], lang, version)
+                phones, word2ph, norm_text, _ = self.clean_text_inf(textlist[i], lang, version)
                 bert = self.get_bert_inf(phones, word2ph, norm_text, lang)
                 phones_list.append(phones)
                 norm_text_list.append(norm_text)
@@ -205,9 +205,9 @@ class TextPreprocessor:
 
     def clean_text_inf(self, text: str, language: str, version: str = "v2"):
         language = language.replace("all_", "")
-        phones, word2ph, norm_text = clean_text(text, language, version)
-        phones = cleaned_text_to_sequence(phones, version)
-        return phones, word2ph, norm_text
+        phones_raw, word2ph, norm_text, mapping = clean_text(text, language, version)
+        phones = cleaned_text_to_sequence(phones_raw, version)
+        return phones, word2ph, norm_text, mapping
 
     def get_bert_inf(self, phones: list, word2ph: list, norm_text: str, language: str):
         language = language.replace("all_", "")

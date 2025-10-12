@@ -1,8 +1,11 @@
 import pickle
 import os
 import re
+from typing import List, Sequence, Tuple
+
 import wordsegment
 from g2p_en import G2p
+from GPT_SoVITS.text.en_normalization.expend_with_map import apply_regex_with_map, normalize_with_map
 
 from text.symbols import punctuation
 
@@ -30,6 +33,8 @@ rep_map = {
     "！": "!",
     "？": "?",
 }
+
+REP_PATTERNS: List[Tuple[re.Pattern, str]] = [(re.compile(pattern), replacement) for pattern, replacement in rep_map.items()]
 
 
 arpa = {
@@ -120,11 +125,23 @@ def replace_phs(phs):
     return phs_new
 
 
-def replace_consecutive_punctuation(text):
-    punctuations = "".join(re.escape(p) for p in punctuation)
-    pattern = f"([{punctuations}\s])([{punctuations}])+"
-    result = re.sub(pattern, r"\1", text)
-    return result
+def replace_consecutive_punctuation_with_map(text: str, span_map: Sequence[Tuple[int, int]]):
+    if not text:
+        return text, list(span_map)
+
+    new_text: List[str] = []
+    new_map: List[Tuple[int, int]] = []
+    last_is_punc = False
+
+    for ch, span in zip(text, span_map):
+        is_punc = ch in punctuation or ch.isspace()
+        if is_punc and last_is_punc:
+            continue
+        new_text.append(ch)
+        new_map.append(span)
+        last_is_punc = is_punc
+
+    return ''.join(new_text), new_map
 
 
 def read_dict():
@@ -229,6 +246,44 @@ def get_namedict():
     return name_dict
 
 
+Span = Tuple[int, int]
+
+
+def _apply_rep_map_with_spans(text: str) -> Tuple[str, List[Span]]:
+    current_text = text
+    current_map: List[Span] = [(idx, idx + 1) for idx in range(len(text))]
+
+    for pattern, replacement in REP_PATTERNS:
+        # Use closure default to capture replacement value per iteration
+        current_text, current_map = apply_regex_with_map(
+            pattern,
+            (lambda rep: (lambda _m: rep))(replacement),
+            current_text,
+            current_map,
+        )
+
+    return current_text, current_map
+
+
+def _remap_spans(child_spans: Sequence[Span], parent_map: Sequence[Span]) -> List[Span]:
+    if not parent_map:
+        return list(child_spans)
+
+    remapped: List[Span] = []
+    max_idx = len(parent_map) - 1
+    for start_idx, end_idx in child_spans:
+        start_idx_clamped = min(max(start_idx, 0), max_idx)
+        start_span = parent_map[start_idx_clamped]
+        if end_idx <= 0:
+            end_span = start_span
+        else:
+            end_idx_clamped = min(max(end_idx - 1, 0), max_idx)
+            end_span = parent_map[end_idx_clamped]
+        remapped.append((start_span[0], max(start_span[0], end_span[1])))
+
+    return remapped
+
+
 def text_normalize(text):
     """
     Normalize English text and return character-level mapping.
@@ -237,30 +292,9 @@ def text_normalize(text):
 
     This version uses accurate step-by-step tracking through all normalization stages.
     """
-    from GPT_SoVITS.text.en_normalization.expend_with_map import normalize_with_map
 
-    # Step 1: Apply rep_map replacements with tracking
-    text_step1 = text
-    map_step1 = list(range(len(text)))
-
-    for pattern_str, replacement in rep_map.items():
-        new_text = []
-        new_map = []
-        pos = 0
-        while pos < len(text_step1):
-            if text_step1[pos:pos + len(pattern_str)] == pattern_str:
-                # Found match - replace and map all replacement chars to source position
-                source_pos = map_step1[pos]
-                for _ in replacement:
-                    new_text.append(_)
-                    new_map.append(source_pos)
-                pos += len(pattern_str)
-            else:
-                new_text.append(text_step1[pos])
-                new_map.append(map_step1[pos])
-                pos += 1
-        text_step1 = ''.join(new_text)
-        map_step1 = new_map
+    # Step 1: Apply rep_map replacements with span tracking
+    text_step1, map_step1 = _apply_rep_map_with_spans(text)
 
     # Step 2: Apply unicode conversion (should not change length for English)
     text_step1 = unicode(text_step1)
@@ -268,49 +302,11 @@ def text_normalize(text):
     # Step 3: Apply normalize() with mapping
     text_step2, map_step2_temp = normalize_with_map(text_step1)
 
-    # Remap through step1's mapping
-    map_step2 = []
-    for idx in map_step2_temp:
-        if idx < len(map_step1):
-            map_step2.append(map_step1[idx])
-        else:
-            map_step2.append(map_step1[-1] if map_step1 else 0)
+    # Remap spans back to original text
+    map_step2 = _remap_spans(map_step2_temp, map_step1)
 
     # Step 4: Replace consecutive punctuation
-    text_final = replace_consecutive_punctuation(text_step2)
-
-    if text_final == text_step2:
-        # No change
-        map_final = map_step2
-    else:
-        # Build mapping for consecutive punctuation removal
-        # This removes consecutive punctuation, keeping only the first
-        map_final = []
-        i = 0
-        while i < len(text_step2):
-            char = text_step2[i]
-            if char in punctuation:
-                # This is punctuation - add it
-                map_final.append(map_step2[i] if i < len(map_step2) else 0)
-                # Skip consecutive punctuation
-                j = i + 1
-                while j < len(text_step2) and text_step2[j] in punctuation:
-                    j += 1
-                i = j
-            elif i < len(text_final):
-                # Regular character
-                # Find corresponding position in text_final
-                final_pos = len(map_final)
-                if final_pos < len(text_final) and text_final[final_pos] == text_step2[i]:
-                    map_final.append(map_step2[i] if i < len(map_step2) else 0)
-                i += 1
-            else:
-                i += 1
-
-        # Ensure map_final has correct length
-        while len(map_final) < len(text_final):
-            map_final.append(map_step2[-1] if map_step2 else 0)
-        map_final = map_final[:len(text_final)]
+    text_final, map_final = replace_consecutive_punctuation_with_map(text_step2, map_step2)
 
     return text_final, map_final
 

@@ -89,7 +89,7 @@ if os.path.exists(txt_path) == False:
                 name = clean_path(name)
                 name = os.path.basename(name)
                 print(name)
-                phones, word2ph, norm_text = clean_text(text.replace("%", "-").replace("￥", ","), lan, version)
+                phones, word2ph, norm_text, _ = clean_text(text.replace("%", "-").replace("￥", ","), lan, version)
                 path_bert = "%s/%s.pt" % (bert_dir, name)
                 if os.path.exists(path_bert) == False and lan == "zh":
                     bert_feature = get_bert_feature(norm_text, word2ph)
