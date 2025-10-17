@@ -145,6 +145,7 @@ import json
 import os
 import re
 import sys
+from typing import Dict, List, Tuple
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -171,6 +172,7 @@ from peft import LoraConfig, get_peft_model
 from AR.models.t2s_lightning_module import Text2SemanticLightningModule
 from text import cleaned_text_to_sequence
 from text.cleaner import clean_text
+from text.mixed_mapping import build_mixed_mappings
 from module.mel_processing import spectrogram_torch
 import config as global_config
 import logging
@@ -524,9 +526,9 @@ def get_bert_feature(text, word2ph):
 
 def clean_text_inf(text, language, version):
     language = language.replace("all_", "")
-    phones, word2ph, norm_text = clean_text(text, language, version)
-    phones = cleaned_text_to_sequence(phones, version)
-    return phones, word2ph, norm_text
+    phones_raw, word2ph, norm_text, mapping = clean_text(text, language, version)
+    phones = cleaned_text_to_sequence(phones_raw, version)
+    return phones, word2ph, norm_text, mapping
 
 
 def get_bert_inf(phones, word2ph, norm_text, language):
@@ -597,7 +599,7 @@ def get_phones_and_bert(text, language, version, final=False):
     norm_text_list = []
     for i in range(len(textlist)):
         lang = langlist[i]
-        phones, word2ph, norm_text = clean_text_inf(textlist[i], lang, version)
+        phones, word2ph, norm_text, _ = clean_text_inf(textlist[i], lang, version)
         bert = get_bert_inf(phones, word2ph, norm_text, lang)
         phones_list.append(phones)
         norm_text_list.append(norm_text)
@@ -642,84 +644,7 @@ def _viterbi_monotonic(p: torch.Tensor):
 
 
 def _build_mixed_mappings_for_api(_text: str, _ui_lang: str, _version: str):
-    _text = re.sub(r' {2,}', ' ', _text)
-    textlist = []
-    langlist = []
-    if _ui_lang == "all_zh":
-        for tmp in LangSegmenter.getTexts(_text, "zh"):
-            langlist.append(tmp["lang"])
-            textlist.append(tmp["text"])
-    elif _ui_lang == "all_yue":
-        for tmp in LangSegmenter.getTexts(_text, "zh"):
-            if tmp["lang"] == "zh":
-                tmp["lang"] = "yue"
-            langlist.append(tmp["lang"])
-            textlist.append(tmp["text"])
-    elif _ui_lang == "all_ja":
-        for tmp in LangSegmenter.getTexts(_text, "ja"):
-            langlist.append(tmp["lang"])
-            textlist.append(tmp["text"])
-    elif _ui_lang == "all_ko":
-        for tmp in LangSegmenter.getTexts(_text, "ko"):
-            langlist.append(tmp["lang"])
-            textlist.append(tmp["text"])
-    elif _ui_lang == "en":
-        langlist.append("en")
-        textlist.append(_text)
-    elif _ui_lang == "auto":
-        for tmp in LangSegmenter.getTexts(_text):
-            langlist.append(tmp["lang"])
-            textlist.append(tmp["text"])
-    elif _ui_lang == "auto_yue":
-        for tmp in LangSegmenter.getTexts(_text):
-            if tmp["lang"] == "zh":
-                tmp["lang"] = "yue"
-            langlist.append(tmp["lang"])
-            textlist.append(tmp["text"])
-    else:
-        for tmp in LangSegmenter.getTexts(_text):
-            if langlist:
-                if (tmp["lang"] == "en" and langlist[-1] == "en") or (tmp["lang"] != "en" and langlist[-1] != "en"):
-                    textlist[-1] += tmp["text"]
-                    continue
-            if tmp["lang"] == "en":
-                langlist.append(tmp["lang"])
-            else:
-                langlist.append(_ui_lang)
-            textlist.append(tmp["text"])
-
-    ph_to_char = []
-    ph_to_word = []
-    word_tokens = []
-    norm_text_agg = []
-    import re as _re
-    for seg_text, seg_lang in zip(textlist, langlist):
-        seg_phones, seg_word2ph, seg_norm = clean_text_inf(seg_text, seg_lang, _version)
-        norm_text_agg.append(seg_norm)
-        if seg_lang in {"zh", "yue", "ja"} and seg_word2ph:
-            char_base_idx = len("".join(norm_text_agg[:-1]))
-            for ch_idx, cnt in enumerate(seg_word2ph):
-                global_char_idx = char_base_idx + ch_idx
-                ph_to_char += [global_char_idx] * cnt
-                token = seg_norm[ch_idx] if ch_idx < len(seg_norm) else ""
-                word_tokens.append(token)
-                word_idx = len(word_tokens) - 1
-                ph_to_word += [word_idx] * cnt
-        elif seg_lang in {"en", "ko"} and seg_word2ph:
-            tokens_seg = [t for t in _re.findall(r"\S+", seg_norm) if not all((c in splits) for c in t)]
-            base_word_idx = len(word_tokens)
-            t_idx = 0
-            for cnt in seg_word2ph:
-                if t_idx < len(tokens_seg):
-                    ph_to_word += [base_word_idx + t_idx] * cnt
-                    t_idx += 1
-            ph_to_char += [-1] * len(seg_phones)
-            word_tokens.extend(tokens_seg)
-        else:
-            ph_to_char += [-1] * len(seg_phones)
-            ph_to_word += [-1] * len(seg_phones)
-    norm_text_agg = "".join(norm_text_agg)
-    return norm_text_agg, ph_to_char, ph_to_word, word_tokens
+    return build_mixed_mappings(_text, _ui_lang, _version, clean_text_inf, splits)
 
 class DictToAttrRecursive(dict):
     def __init__(self, input_dict):
@@ -1763,52 +1688,63 @@ async def tts_json_post(request: Request):
                     "end_s": assign.shape[0] * frame_time,
                 })
 
-            norm_text_seg, ph_to_char_map, ph_to_word_map, word_tokens = _build_mixed_mappings_for_api(text, text_language, version)
+            norm_text_seg, ph_to_segment_map, segment_infos, original_text_seg, segments_raw = _build_mixed_mappings_for_api(text, text_language, version)
 
-            char_spans = []
-            if ph_spans and ph_to_char_map and len(ph_to_char_map) >= 1:
+            segment_spans = []
+            if segment_infos:
+                segment_entries = []
+                for seg in segment_infos:
+                    segment_entries.append({
+                        "text_original": seg.get("text_original", ""),
+                        "text_norm": seg.get("text_norm", ""),
+                        "orig_start": seg.get("orig_start", -1),
+                        "orig_end": seg.get("orig_end", -1),
+                        "text_norm_indices": (seg.get("norm_start", 0), seg.get("norm_end", 0)),
+                        "start_s": None,
+                        "end_s": None,
+                    })
+
                 for span in ph_spans:
                     ph_idx = span["phoneme_id"]
-                    if 0 <= ph_idx < len(ph_to_char_map):
-                        ci = ph_to_char_map[ph_idx]
-                        if ci == -1:
+                    if 0 <= ph_idx < len(ph_to_segment_map):
+                        seg_id = ph_to_segment_map[ph_idx]
+                        if seg_id is None or not (0 <= seg_id < len(segment_entries)):
                             continue
-                        if len(char_spans) == 0 or char_spans[-1]["char_index"] != ci:
-                            char_spans.append({
-                                "char_index": ci,
-                                "char": norm_text_seg[ci] if ci < len(norm_text_seg) else "",
-                                "start_s": span["start_s"],
-                                "end_s": span["end_s"],
-                            })
-                        else:
-                            char_spans[-1]["end_s"] = span["end_s"]
-            word_spans = []
-            if ph_spans and ph_to_word_map and len(ph_to_word_map) >= 1:
-                for span in ph_spans:
-                    ph_idx = span["phoneme_id"]
-                    if 0 <= ph_idx < len(ph_to_word_map):
-                        wi = ph_to_word_map[ph_idx]
-                        if wi == -1:
-                            continue
-                        if len(word_spans) == 0 or word_spans[-1]["word_index"] != wi:
-                            word_spans.append({
-                                "word_index": wi,
-                                "word": word_tokens[wi] if wi < len(word_tokens) else "",
-                                "start_s": span["start_s"],
-                                "end_s": span["end_s"],
-                            })
-                        else:
-                            word_spans[-1]["end_s"] = span["end_s"]
+                        entry = segment_entries[seg_id]
+                        start_s = span["start_s"]
+                        end_s = span["end_s"]
+                        if entry["start_s"] is None or start_s < entry["start_s"]:
+                            entry["start_s"] = start_s
+                        if entry["end_s"] is None or end_s > entry["end_s"]:
+                            entry["end_s"] = end_s
+
+                for entry in segment_entries:
+                    if entry["start_s"] is None or entry["end_s"] is None:
+                        continue
+                    segment_spans.append({
+                        "text": entry["text_original"] or entry["text_norm"],
+                        "text_original": entry["text_original"] or entry["text_norm"],
+                        "text_norm": entry["text_norm"],
+                        "start_s": entry["start_s"],
+                        "end_s": entry["end_s"],
+                        "orig_start": entry["orig_start"],
+                        "orig_end": entry["orig_end"],
+                        "norm_range": entry.get("text_norm_indices", (0, 0)),
+                    })
+                segment_spans.sort(key=lambda x: x["start_s"])
 
             audio_len_s = float(len(audio)) / float(sr)
             timestamps_all.append({
                 "segment_index": 0,
                 "phoneme_spans": ph_spans,
-                "char_spans": char_spans,
-                "word_spans": word_spans,
+                "char_spans": [],
+                "word_spans": [],
+                "segment_spans": segment_spans,
+                "segment_details": segments_raw,
                 "segment_start_s": 0.0,
                 "segment_end_s": audio_len_s,
                 "text": norm_text_seg,
+                "text_original": original_text_seg,
             })
 
         import soundfile as sf
@@ -1828,8 +1764,18 @@ async def tts_json_post(request: Request):
             srt_lines = []
             idx_counter = 1
             for rec in timestamps_all:
+                ss = rec.get("segment_spans") or []
                 ws = rec.get("word_spans") or []
                 cs = rec.get("char_spans") or []
+
+                if ss:
+                    for seg in ss:
+                        srt_lines.append(str(idx_counter))
+                        srt_lines.append(f"{_fmt_srt_time(seg['start_s'])} --> { _fmt_srt_time(seg['end_s'])}")
+                        srt_lines.append(seg.get("text", ""))
+                        srt_lines.append("")
+                        idx_counter += 1
+                    continue
 
                 if ws:
                     for w in ws:
@@ -1848,6 +1794,16 @@ async def tts_json_post(request: Request):
                         srt_lines.append("")
                         idx_counter += 1
                     continue
+
+                st = rec.get("segment_start_s")
+                ed = rec.get("segment_end_s")
+                text_line = rec.get("text_original") or rec.get("text", "")
+                if st is not None and ed is not None:
+                    srt_lines.append(str(idx_counter))
+                    srt_lines.append(f"{_fmt_srt_time(st)} --> { _fmt_srt_time(ed)}")
+                    srt_lines.append(text_line)
+                    srt_lines.append("")
+                    idx_counter += 1
             srt_b64 = base64.b64encode("\n".join(srt_lines).encode("utf-8")).decode("ascii")
 
         timestamps_json_b64 = base64.b64encode(json.dumps(timestamps_all, ensure_ascii=False).encode("utf-8")).decode("ascii")
