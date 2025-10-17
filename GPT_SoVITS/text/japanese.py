@@ -302,7 +302,16 @@ def g2p_with_word2ph(text, keep_punc=False):
     - Per-character g2p; ignore prosody markers like '[', ']','^', '$', '#', '_'
     - Punctuation counted as 1 if keep_punc else skipped
     """
-    norm_text = text_normalize(text)
+
+    if isinstance(text, tuple):
+        norm_text, _ = text
+    else:
+        norm_result = text_normalize(text)
+        if isinstance(norm_result, tuple):
+            norm_text, _ = norm_result
+        else:
+            norm_text = norm_result
+
     phones_all = []
     word2ph = []
     prosody_markers = {'[', ']', '^', '$', '#', '_'}
