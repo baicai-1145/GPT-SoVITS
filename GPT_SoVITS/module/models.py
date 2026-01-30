@@ -164,6 +164,7 @@ class TextEncoder(nn.Module):
         kernel_size,
         p_dropout,
         latent_channels=192,
+        semantic_dim: int = 768,
         version="v2",
     ):
         super().__init__()
@@ -177,7 +178,10 @@ class TextEncoder(nn.Module):
         self.latent_channels = latent_channels
         self.version = version
 
-        self.ssl_proj = nn.Conv1d(768, hidden_channels, 1)
+        # Content / semantic feature projection.
+        # Default is CN-HuBERT 768-dim. For Omni embeddings, set semantic_dim=2048 (or other).
+        self.semantic_dim = int(semantic_dim)
+        self.ssl_proj = nn.Conv1d(self.semantic_dim, hidden_channels, 1)
 
         self.encoder_ssl = attentions.Encoder(
             hidden_channels,
@@ -852,6 +856,8 @@ class SynthesizerTrn(nn.Module):
         gin_channels=0,
         use_sdp=True,
         semantic_frame_rate=None,
+        semantic_dim: int = 768,
+        use_quantizer: bool = True,
         freeze_quantizer=None,
         version="v2",
         **kwargs,
@@ -875,6 +881,8 @@ class SynthesizerTrn(nn.Module):
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
         self.version = version
+        self.semantic_dim = int(semantic_dim)
+        self.use_quantizer = bool(use_quantizer)
 
         self.use_sdp = use_sdp
         self.enc_p = TextEncoder(
@@ -885,6 +893,7 @@ class SynthesizerTrn(nn.Module):
             n_layers,
             kernel_size,
             p_dropout,
+            semantic_dim=self.semantic_dim,
             version=version,
         )
         self.dec = Generator(
@@ -914,15 +923,27 @@ class SynthesizerTrn(nn.Module):
         else:
             self.ref_enc = modules.MelStyleEncoder(704, style_vector_dim=gin_channels)
 
+        # Quantizer pipeline is the legacy CN-HuBERT discrete/quantized path.
+        # For Omni continuous embeddings, set use_quantizer=False and feed semantic directly to enc_p.
         ssl_dim = 768
-        assert semantic_frame_rate in ["25hz", "50hz"]
-        self.semantic_frame_rate = semantic_frame_rate
-        if semantic_frame_rate == "25hz":
-            self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 2, stride=2)
+        if self.use_quantizer:
+            if self.semantic_dim != ssl_dim:
+                raise ValueError(
+                    f"use_quantizer=True currently expects semantic_dim=={ssl_dim}, got {self.semantic_dim}. "
+                    "For continuous embeddings (e.g. Omni 2048-d), set use_quantizer=False."
+                )
+            assert semantic_frame_rate in ["25hz", "50hz"]
+            self.semantic_frame_rate = semantic_frame_rate
+            if semantic_frame_rate == "25hz":
+                self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 2, stride=2)
+            else:
+                self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 1, stride=1)
+            self.quantizer = ResidualVectorQuantizer(dimension=ssl_dim, n_q=1, bins=1024)
         else:
-            self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 1, stride=1)
-
-        self.quantizer = ResidualVectorQuantizer(dimension=ssl_dim, n_q=1, bins=1024)
+            # Keep attributes for compatibility; not used.
+            self.semantic_frame_rate = semantic_frame_rate
+            self.ssl_proj = None
+            self.quantizer = None
         self.freeze_quantizer = freeze_quantizer
 
         self.is_v2pro = self.version in v2pro_set
@@ -942,17 +963,21 @@ class SynthesizerTrn(nn.Module):
             ge += sv_emb.unsqueeze(-1)
             ge = self.prelu(ge)
             ge512 = self.ge_to512(ge.transpose(2, 1)).transpose(2, 1)
-        with autocast(enabled=False):
-            maybe_no_grad = torch.no_grad() if self.freeze_quantizer else contextlib.nullcontext()
-            with maybe_no_grad:
-                if self.freeze_quantizer:
-                    self.ssl_proj.eval()
-                    self.quantizer.eval()
-            ssl = self.ssl_proj(ssl)
-            quantized, codes, commit_loss, quantized_list = self.quantizer(ssl, layers=[0])
-
-        if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+        if self.use_quantizer:
+            with autocast(enabled=False):
+                maybe_no_grad = torch.no_grad() if self.freeze_quantizer else contextlib.nullcontext()
+                with maybe_no_grad:
+                    if self.freeze_quantizer:
+                        self.ssl_proj.eval()
+                        self.quantizer.eval()
+                ssl_q = self.ssl_proj(ssl)
+                quantized, _codes, commit_loss, _quantized_list = self.quantizer(ssl_q, layers=[0])
+            if self.semantic_frame_rate == "25hz":
+                quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+        else:
+            # Continuous semantic features (e.g. Omni). No quantization loss.
+            quantized = ssl
+            commit_loss = torch.zeros([], device=ssl.device, dtype=ssl.dtype)
 
         x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge512 if self.is_v2pro else ge)
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=ge)
@@ -977,10 +1002,13 @@ class SynthesizerTrn(nn.Module):
         else:
             ge = self.ref_enc(y[:, :704] * y_mask, y_mask)
 
-        ssl = self.ssl_proj(ssl)
-        quantized, codes, commit_loss, _ = self.quantizer(ssl, layers=[0])
-        if self.semantic_frame_rate == "25hz":
-            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+        if self.use_quantizer:
+            ssl_q = self.ssl_proj(ssl)
+            quantized, _codes, _commit_loss, _ = self.quantizer(ssl_q, layers=[0])
+            if self.semantic_frame_rate == "25hz":
+                quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+        else:
+            quantized = ssl
 
         x, m_p, logs_p, y_mask, _, _ = self.enc_p(quantized, y_lengths, text, text_lengths, ge, test=test)
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
@@ -993,6 +1021,8 @@ class SynthesizerTrn(nn.Module):
 
     @torch.no_grad()
     def decode(self, codes, text, refer, noise_scale=0.5, speed=1, sv_emb=None):
+        if not self.use_quantizer or self.quantizer is None:
+            raise RuntimeError("decode(codes, ...) requires use_quantizer=True. Use decode_from_semantic(...) instead.")
         def get_ge(refer, sv_emb):
             ge = None
             if refer is not None:
@@ -1035,6 +1065,66 @@ class SynthesizerTrn(nn.Module):
 
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
 
+        o = self.dec((z * y_mask)[:, :, :], g=ge)
+        return o
+
+    @torch.no_grad()
+    def decode_from_semantic(self, semantic, text, refer, noise_scale=0.5, speed=1.0, sv_emb=None):
+        """
+        Continuous semantic -> waveform.
+
+        - semantic: Tensor with shape [T, C] or [B, C, T] or [B, T, C]
+        - text: phones ids, shape [B, N]
+        - refer: reference spectrogram, shape [B, n_mels/spec_bins, T_ref]
+        """
+
+        def get_ge(refer, sv_emb):
+            ge = None
+            if refer is not None:
+                refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
+                refer_mask = torch.unsqueeze(commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
+                if self.version == "v1":
+                    ge = self.ref_enc(refer * refer_mask, refer_mask)
+                else:
+                    ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
+                if self.is_v2pro:
+                    sv_emb2 = self.sv_emb(sv_emb)  # B*20480->B*512
+                    ge = ge + sv_emb2.unsqueeze(-1)
+                    ge = self.prelu(ge)
+            return ge
+
+        ge = get_ge(refer, sv_emb)
+
+        # Normalize semantic to [B, C, T]
+        if semantic.dim() == 2:
+            # [T, C] -> [1, C, T]
+            semantic = semantic.unsqueeze(0).transpose(1, 2)
+        elif semantic.dim() == 3:
+            # Accept [B, T, C] or [B, C, T]
+            if semantic.shape[1] != self.semantic_dim and semantic.shape[2] == self.semantic_dim:
+                semantic = semantic.transpose(1, 2)
+        else:
+            raise ValueError(f"semantic must be 2D or 3D tensor, got shape={tuple(semantic.shape)}")
+
+        if semantic.shape[1] != self.semantic_dim:
+            raise ValueError(
+                f"semantic channel mismatch: expected C={self.semantic_dim}, got {semantic.shape[1]} "
+                f"(shape={tuple(semantic.shape)})"
+            )
+
+        y_lengths = torch.LongTensor([semantic.size(2)]).to(semantic.device)
+        text_lengths = torch.LongTensor([text.size(-1)]).to(text.device)
+
+        x, m_p, logs_p, y_mask, _, _ = self.enc_p(
+            semantic,
+            y_lengths,
+            text,
+            text_lengths,
+            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
+            speed,
+        )
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        z = self.flow(z_p, y_mask, g=ge, reverse=True)
         o = self.dec((z * y_mask)[:, :, :], g=ge)
         return o
 
@@ -1092,6 +1182,8 @@ class SynthesizerTrn(nn.Module):
         return o, y_, y_mask_
 
     def extract_latent(self, x):
+        if not self.use_quantizer or self.quantizer is None:
+            raise RuntimeError("extract_latent(x) requires use_quantizer=True.")
         ssl = self.ssl_proj(x)
         quantized, codes, commit_loss, quantized_list = self.quantizer(ssl)
         return codes.transpose(0, 1)

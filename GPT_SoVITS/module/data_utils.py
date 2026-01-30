@@ -12,6 +12,52 @@ from tools.my_utils import load_audio
 
 version = os.environ.get("version", None)
 
+def _as_feature_tensor(obj: object) -> torch.Tensor:
+    """
+    Normalize loaded content feature into shape [1, C, T].
+
+    Supported:
+    - Tensor [1, C, T] (legacy CN-HuBERT cache)
+    - Tensor [T, C] (e.g. Omni last_hidden_state)
+    - Dict with key 'last_hidden_state' -> Tensor [T, C]
+    """
+    if isinstance(obj, dict) and "last_hidden_state" in obj:
+        obj = obj["last_hidden_state"]
+    if not isinstance(obj, torch.Tensor):
+        obj = torch.tensor(obj)
+    x = obj
+    if x.dim() == 2:
+        # [T, C] -> [1, C, T]
+        x = x.transpose(0, 1).unsqueeze(0)
+    elif x.dim() == 3:
+        # prefer [B, C, T]; if [B, T, C] then transpose
+        if x.shape[1] < x.shape[2] and x.shape[2] <= 4096:
+            # ambiguous; keep as is (likely [B, C, T])
+            pass
+        elif x.shape[2] > x.shape[1]:
+            x = x.transpose(1, 2)
+    else:
+        raise ValueError(f"Unsupported feature tensor rank: {x.dim()} (shape={tuple(x.shape)})")
+    return x
+
+
+def _match_feature_length(x: torch.Tensor, target_len: int) -> torch.Tensor:
+    """
+    Make x.shape[-1] match target_len.
+    - If off by <=1: pad by replicate (legacy behavior).
+    - Else: interpolate in time (linear).
+    """
+    cur = int(x.shape[-1])
+    target_len = int(target_len)
+    if cur == target_len:
+        return x
+    if abs(cur - target_len) <= 1:
+        if cur < target_len:
+            return F.pad(x.float(), (0, target_len - cur), mode="replicate").to(x.dtype)
+        return x[..., :target_len]
+    x_rs = F.interpolate(x.float(), size=target_len, mode="linear", align_corners=False)
+    return x_rs.to(x.dtype)
+
 
 # ZeroDivisionError fixed by Tybost (https://github.com/RVC-Boss/GPT-SoVITS/issues/79)
 class TextAudioSpeakerLoader(torch.utils.data.Dataset):
@@ -24,7 +70,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     def __init__(self, hparams, version=None, val=False):
         exp_dir = hparams.exp_dir
         self.path2 = "%s/2-name2text.txt" % exp_dir
-        self.path4 = "%s/4-cnhubert" % exp_dir
+        # Content feature directory:
+        # - legacy: 4-cnhubert (CN-HuBERT 768-d)
+        # - audio_tower / omni: 4-audio_tower (dict with last_hidden_state[T,2048] etc.)
+        self.path4 = "%s/%s" % (exp_dir, getattr(hparams, "content_feature_dir", "4-cnhubert"))
         self.path5 = "%s/5-wav32k" % exp_dir
         assert os.path.exists(self.path2)
         assert os.path.exists(self.path4)
@@ -112,10 +161,9 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         try:
             spec, wav = self.get_audio("%s/%s" % (self.path5, audiopath))
             with torch.no_grad():
-                ssl = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
-                if ssl.shape[-1] != spec.shape[-1]:
-                    typee = ssl.dtype
-                    ssl = F.pad(ssl.float(), (0, 1), mode="replicate").to(typee)
+                raw = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
+                ssl = _as_feature_tensor(raw)
+                ssl = _match_feature_length(ssl, spec.shape[-1])
                 ssl.requires_grad = False
                 if self.is_v2Pro:
                     sv_emb = torch.load("%s/%s.pt" % (self.path7, audiopath), map_location="cpu")
@@ -286,7 +334,7 @@ class TextAudioSpeakerLoaderV3(torch.utils.data.Dataset):
     def __init__(self, hparams, val=False):
         exp_dir = hparams.exp_dir
         self.path2 = "%s/2-name2text.txt" % exp_dir
-        self.path4 = "%s/4-cnhubert" % exp_dir
+        self.path4 = "%s/%s" % (exp_dir, getattr(hparams, "content_feature_dir", "4-cnhubert"))
         self.path5 = "%s/5-wav32k" % exp_dir
         assert os.path.exists(self.path2)
         assert os.path.exists(self.path4)
@@ -378,10 +426,9 @@ class TextAudioSpeakerLoaderV3(torch.utils.data.Dataset):
         try:
             spec, mel = self.get_audio("%s/%s" % (self.path5, audiopath))
             with torch.no_grad():
-                ssl = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
-                if ssl.shape[-1] != spec.shape[-1]:
-                    typee = ssl.dtype
-                    ssl = F.pad(ssl.float(), (0, 1), mode="replicate").to(typee)
+                raw = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
+                ssl = _as_feature_tensor(raw)
+                ssl = _match_feature_length(ssl, spec.shape[-1])
                 ssl.requires_grad = False
         except:
             traceback.print_exc()
@@ -524,7 +571,7 @@ class TextAudioSpeakerLoaderV4(torch.utils.data.Dataset):
     def __init__(self, hparams, val=False):
         exp_dir = hparams.exp_dir
         self.path2 = "%s/2-name2text.txt" % exp_dir
-        self.path4 = "%s/4-cnhubert" % exp_dir
+        self.path4 = "%s/%s" % (exp_dir, getattr(hparams, "content_feature_dir", "4-cnhubert"))
         self.path5 = "%s/5-wav32k" % exp_dir
         assert os.path.exists(self.path2)
         assert os.path.exists(self.path4)
@@ -616,10 +663,9 @@ class TextAudioSpeakerLoaderV4(torch.utils.data.Dataset):
         try:
             spec, mel = self.get_audio("%s/%s" % (self.path5, audiopath))
             with torch.no_grad():
-                ssl = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
-                if ssl.shape[-1] != spec.shape[-1]:
-                    typee = ssl.dtype
-                    ssl = F.pad(ssl.float(), (0, 1), mode="replicate").to(typee)
+                raw = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
+                ssl = _as_feature_tensor(raw)
+                ssl = _match_feature_length(ssl, spec.shape[-1])
                 ssl.requires_grad = False
         except:
             traceback.print_exc()
@@ -735,7 +781,7 @@ class TextAudioSpeakerLoaderV3b(torch.utils.data.Dataset):
     def __init__(self, hparams, val=False):
         exp_dir = hparams.exp_dir
         self.path2 = "%s/2-name2text.txt" % exp_dir
-        self.path4 = "%s/4-cnhubert" % exp_dir
+        self.path4 = "%s/%s" % (exp_dir, getattr(hparams, "content_feature_dir", "4-cnhubert"))
         self.path5 = "%s/5-wav32k" % exp_dir
         assert os.path.exists(self.path2)
         assert os.path.exists(self.path4)
@@ -827,10 +873,9 @@ class TextAudioSpeakerLoaderV3b(torch.utils.data.Dataset):
         try:
             spec, mel, wav = self.get_audio("%s/%s" % (self.path5, audiopath))
             with torch.no_grad():
-                ssl = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
-                if ssl.shape[-1] != spec.shape[-1]:
-                    typee = ssl.dtype
-                    ssl = F.pad(ssl.float(), (0, 1), mode="replicate").to(typee)
+                raw = torch.load("%s/%s.pt" % (self.path4, audiopath), map_location="cpu")
+                ssl = _as_feature_tensor(raw)
+                ssl = _match_feature_length(ssl, spec.shape[-1])
                 ssl.requires_grad = False
         except:
             traceback.print_exc()
