@@ -932,13 +932,13 @@ class SynthesizerTrn(nn.Module):
                     f"use_quantizer=True currently expects semantic_dim=={ssl_dim}, got {self.semantic_dim}. "
                     "For continuous embeddings (e.g. Omni 2048-d), set use_quantizer=False."
                 )
-            assert semantic_frame_rate in ["25hz", "50hz"]
-            self.semantic_frame_rate = semantic_frame_rate
-            if semantic_frame_rate == "25hz":
-                self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 2, stride=2)
-            else:
-                self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 1, stride=1)
-            self.quantizer = ResidualVectorQuantizer(dimension=ssl_dim, n_q=1, bins=1024)
+        assert semantic_frame_rate in ["25hz", "50hz"]
+        self.semantic_frame_rate = semantic_frame_rate
+        if semantic_frame_rate == "25hz":
+            self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 2, stride=2)
+        else:
+            self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 1, stride=1)
+        self.quantizer = ResidualVectorQuantizer(dimension=ssl_dim, n_q=1, bins=1024)
         else:
             # Keep attributes for compatibility; not used.
             self.semantic_frame_rate = semantic_frame_rate
@@ -964,16 +964,16 @@ class SynthesizerTrn(nn.Module):
             ge = self.prelu(ge)
             ge512 = self.ge_to512(ge.transpose(2, 1)).transpose(2, 1)
         if self.use_quantizer:
-            with autocast(enabled=False):
-                maybe_no_grad = torch.no_grad() if self.freeze_quantizer else contextlib.nullcontext()
-                with maybe_no_grad:
-                    if self.freeze_quantizer:
-                        self.ssl_proj.eval()
-                        self.quantizer.eval()
+        with autocast(enabled=False):
+            maybe_no_grad = torch.no_grad() if self.freeze_quantizer else contextlib.nullcontext()
+            with maybe_no_grad:
+                if self.freeze_quantizer:
+                    self.ssl_proj.eval()
+                    self.quantizer.eval()
                 ssl_q = self.ssl_proj(ssl)
                 quantized, _codes, commit_loss, _quantized_list = self.quantizer(ssl_q, layers=[0])
-            if self.semantic_frame_rate == "25hz":
-                quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+        if self.semantic_frame_rate == "25hz":
+            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
         else:
             # Continuous semantic features (e.g. Omni). No quantization loss.
             quantized = ssl
@@ -1005,8 +1005,8 @@ class SynthesizerTrn(nn.Module):
         if self.use_quantizer:
             ssl_q = self.ssl_proj(ssl)
             quantized, _codes, _commit_loss, _ = self.quantizer(ssl_q, layers=[0])
-            if self.semantic_frame_rate == "25hz":
-                quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
+        if self.semantic_frame_rate == "25hz":
+            quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
         else:
             quantized = ssl
 

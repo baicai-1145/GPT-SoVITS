@@ -24,6 +24,7 @@ SoVITS 侧已做兼容，可直接读取 dict 并对齐长度。
 from __future__ import annotations
 
 import glob
+import math
 import os
 import shutil
 import sys
@@ -34,6 +35,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 from scipy.io import wavfile
+from scipy.signal import resample_poly
 
 if "_CUDA_VISIBLE_DEVICES" in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["_CUDA_VISIBLE_DEVICES"]
@@ -48,9 +50,31 @@ audio_tower_dir = os.environ.get(
     "audio_tower_dir", os.path.join("GPT_SoVITS", "pretrained_models", "audio_tower")
 )
 
-now_dir = os.getcwd()
-sys.path.append(now_dir)
-from tools.my_utils import clean_path, load_audio  # noqa: E402
+def clean_path(path: str) -> str:
+    # Minimal replacement to avoid pulling heavy deps (e.g. gradio) from tools/my_utils.py.
+    return path.strip().strip('"').strip("'")
+
+
+def load_audio(path: str, target_sr: int) -> np.ndarray:
+    """
+    Minimal WAV loader + resampler.
+    Returns mono float32 in [-1, 1].
+    """
+    sr, data = wavfile.read(path)
+    if data.ndim == 2:
+        data = data.mean(axis=1)
+    # int16/int32/float -> float32 [-1,1]
+    if np.issubdtype(data.dtype, np.integer):
+        maxv = float(np.iinfo(data.dtype).max)
+        wav = data.astype(np.float32) / maxv
+    else:
+        wav = data.astype(np.float32)
+    if int(sr) != int(target_sr):
+        g = math.gcd(int(sr), int(target_sr))
+        up = int(target_sr) // g
+        down = int(sr) // g
+        wav = resample_poly(wav, up, down).astype(np.float32, copy=False)
+    return wav
 
 
 def _pick_one(patterns: List[str], base_dir: str) -> str:
