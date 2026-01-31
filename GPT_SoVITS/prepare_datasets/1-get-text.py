@@ -19,7 +19,10 @@ import traceback
 import os.path
 from text.cleaner import clean_text
 from transformers import AutoModelForMaskedLM, AutoTokenizer
-from tools.my_utils import clean_path
+
+def clean_path(path: str) -> str:
+    # Minimal replacement to avoid pulling heavy deps (e.g. gradio) from tools/my_utils.py.
+    return path.strip().strip('"').strip("'")
 
 # inp_text=sys.argv[1]
 # inp_wav_dir=sys.argv[2]
