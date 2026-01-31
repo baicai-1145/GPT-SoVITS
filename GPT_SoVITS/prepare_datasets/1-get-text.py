@@ -129,7 +129,8 @@ if os.path.exists(txt_path) == False:
     }
     for line in lines[int(i_part) :: int(all_parts)]:
         try:
-            wav_name, spk_name, language, text = line.split("|")
+            # text can contain '|', so only split the first 3 separators.
+            wav_name, spk_name, language, text = line.split("|", 3)
             # todo.append([name,text,"zh"])
             if language in language_v1_to_language_v2.keys():
                 todo.append([wav_name, text, language_v1_to_language_v2.get(language, language)])

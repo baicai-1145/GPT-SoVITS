@@ -104,7 +104,7 @@ with open(inp_text, "r", encoding="utf8") as f:
 
 for line in lines[int(i_part) :: int(all_parts)]:
     try:
-        wav_name, spk_name, language, text = line.split("|")
+        wav_name, spk_name, language, text = line.split("|", 3)
         wav_name = clean_path(wav_name)
         if inp_wav_dir != "" and inp_wav_dir != None:
             wav_name = os.path.basename(wav_name)

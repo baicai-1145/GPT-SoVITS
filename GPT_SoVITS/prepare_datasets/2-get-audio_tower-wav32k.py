@@ -69,6 +69,10 @@ def load_audio(path: str, target_sr: int) -> np.ndarray:
         wav = data.astype(np.float32) / maxv
     else:
         wav = data.astype(np.float32)
+        # Some datasets store float wavs not normalized to [-1, 1]. Normalize defensively.
+        absmax = float(np.max(np.abs(wav))) if wav.size else 0.0
+        if absmax > 1.5 and np.isfinite(absmax):
+            wav = (wav / absmax).astype(np.float32, copy=False)
     if int(sr) != int(target_sr):
         g = math.gcd(int(sr), int(target_sr))
         up = int(target_sr) // g
@@ -169,7 +173,10 @@ def main():
 
         # 1) wav32k：与原脚本一致的幅度策略
         tmp_audio32 = load_audio(wav_path, 32000)
-        tmp_max = np.abs(tmp_audio32).max()
+        tmp_max = float(np.abs(tmp_audio32).max()) if tmp_audio32.size else 0.0
+        if not np.isfinite(tmp_max) or tmp_max <= 1e-8:
+            print("%s-filtered,too_silent_or_invalid" % wav_name)
+            return
         if tmp_max > 2.2:
             print("%s-filtered,%s" % (wav_name, tmp_max))
             return
@@ -178,8 +185,16 @@ def main():
 
         # 2) audio_tower 输入：16k mono float32
         wav16 = load_audio(wav_path, 16000).astype("float32", copy=False)
+        if wav16.size < 400:
+            # WhisperFeatureExtractor uses n_fft=400; too-short waveforms will crash torch.stft padding.
+            print("%s-filtered,too_short_%d" % (wav_name, int(wav16.size)))
+            return
 
-        inputs = fe([wav16], sampling_rate=16000, return_tensors="pt", padding=True, return_attention_mask=True)
+        try:
+            inputs = fe([wav16], sampling_rate=16000, return_tensors="pt", padding=True, return_attention_mask=True)
+        except Exception as e:
+            print("%s-filtered,feature_extractor_error:%s" % (wav_name, str(e)))
+            return
         input_features = inputs["input_features"]  # [B, F, T]
         feature_attention_mask = inputs.get("attention_mask", None)  # [B, T]
         if feature_attention_mask is None:
@@ -192,8 +207,12 @@ def main():
         feature_lens_dev = feature_lens.to(device=device)
 
         with torch.no_grad():
-            out = audio_model(packed, feature_lens=feature_lens_dev, return_dict=True)
-            last_hidden = out.last_hidden_state  # [sum_out_T, C]
+            try:
+                out = audio_model(packed, feature_lens=feature_lens_dev, return_dict=True)
+                last_hidden = out.last_hidden_state  # [sum_out_T, C]
+            except Exception as e:
+                print("%s-filtered,audio_tower_error:%s" % (wav_name, str(e)))
+                return
 
         out_lens = _get_feat_extract_output_lengths(feature_lens).tolist()
         emb = torch.split(last_hidden, out_lens, dim=0)[0]  # [T_out, C]
@@ -220,7 +239,8 @@ def main():
 
     for line in lines[int(i_part) :: int(all_parts)]:
         try:
-            wav_name, _spk_name, _language, _text = line.split("|")
+            # text can contain '|', so only split the first 3 separators.
+            wav_name, _spk_name, _language, _text = line.split("|", 3)
             wav_name = clean_path(wav_name)
             if inp_wav_dir:
                 wav_name = os.path.basename(wav_name)
