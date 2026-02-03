@@ -19,7 +19,13 @@
     "c_mel": 45,
     "c_kl": 1.0,
     "text_low_lr_rate": 0.4,
-    "grad_ckpt": false
+    "grad_ckpt": false,
+    "gpu_numbers": "0",
+    "save_every_steps": 5000,
+    "save_every_epoch": 0,
+    "if_save_latest": 0,
+    "pretrained_s2G": "",
+    "pretrained_s2D": ""
   },
   "data": {
     "max_wav_value": 32768.0,
@@ -33,9 +39,11 @@
     "add_blank": true,
     "n_speakers": 300,
     "cleaned_text": true,
-    "content_feature_dir": "4-audio_tower"
+    "content_feature_dir": "4-audio_tower",
+    "exp_dir": "/root/GPT-SoVITS/exp_dir"
   },
   "model": {
+    "version": "v2",
     "inter_channels": 192,
     "hidden_channels": 192,
     "filter_channels": 768,
@@ -92,4 +100,3 @@
   "s2_ckpt_dir": "logs/s2/omni2048",
   "content_module": "omni2048"
 }
-
