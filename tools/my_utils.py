@@ -4,13 +4,24 @@ import sys
 from pathlib import Path
 
 import ffmpeg
-import gradio as gr
 import numpy as np
 import pandas as pd
 
 from tools.i18n.i18n import I18nAuto
 
 i18n = I18nAuto(language=os.environ.get("language", "Auto"))
+
+# NOTE(KISS/YAGNI): 训练流程只需要本文件里的 `load_audio()`，不应被 Gradio(UI) 依赖阻断。
+# 因此这里将 gradio 设为可选依赖：导入失败时降级为打印警告，避免训练脚本因 UI 依赖版本冲突而无法启动。
+try:
+    import gradio as gr  # type: ignore
+except Exception as _gradio_import_err:  # noqa: N818
+    class _GradioShim:
+        @staticmethod
+        def Warning(msg):  # noqa: N802
+            print(f"[WARN] {msg}")
+
+    gr = _GradioShim()  # type: ignore
 
 
 def load_audio(file, sr):

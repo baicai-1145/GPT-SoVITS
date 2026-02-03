@@ -511,7 +511,35 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                         scalars=scalar_dict,
                     )
         global_step += 1
-    if epoch % hps.train.save_every_epoch == 0 and rank == 0:
+
+        # Step-based checkpointing (optional).
+        # KISS: only enabled when train.save_every_steps is set (>0).
+        save_every_steps = int(getattr(hps.train, "save_every_steps", 0) or 0)
+        if rank == 0 and save_every_steps > 0 and (global_step % save_every_steps == 0):
+            utils.save_checkpoint(
+                net_g,
+                optim_g,
+                hps.train.learning_rate,
+                epoch,
+                os.path.join(
+                    "%s/logs_s2_%s" % (hps.data.exp_dir, hps.model.version),
+                    "G_{}.pth".format(global_step),
+                ),
+            )
+            utils.save_checkpoint(
+                net_d,
+                optim_d,
+                hps.train.learning_rate,
+                epoch,
+                os.path.join(
+                    "%s/logs_s2_%s" % (hps.data.exp_dir, hps.model.version),
+                    "D_{}.pth".format(global_step),
+                ),
+            )
+
+    # Epoch-based checkpointing (legacy). Allow disabling by setting save_every_epoch<=0.
+    save_every_epoch = int(getattr(hps.train, "save_every_epoch", 0) or 0)
+    if save_every_epoch > 0 and (epoch % save_every_epoch == 0) and rank == 0:
         if hps.train.if_save_latest == 0:
             utils.save_checkpoint(
                 net_g,
@@ -554,7 +582,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     "D_{}.pth".format(233333333333),
                 ),
             )
-        if rank == 0 and hps.train.if_save_every_weights == True:
+        if rank == 0 and getattr(hps.train, "if_save_every_weights", False) == True:
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
             else:

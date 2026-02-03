@@ -67,9 +67,14 @@ from time import time as ttime
 def my_save(fea, path):  #####fix issue: torch.save doesn't support chinese path
     dir = os.path.dirname(path)
     name = os.path.basename(path)
-    tmp_path = "%s.pth" % (ttime())
+    if dir:
+        os.makedirs(dir, exist_ok=True)
+    # 写到同一目录下的临时文件，再原子替换，避免：
+    # - 目标目录不存在导致 move/copy 失败
+    # - 多进程/工作目录差异导致找不到 tmp 文件
+    tmp_path = os.path.join(dir or ".", f".tmp_{name}.{ttime()}.pth")
     torch.save(fea, tmp_path)
-    shutil.move(tmp_path, "%s/%s" % (dir, name))
+    os.replace(tmp_path, os.path.join(dir or ".", name))
 
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
