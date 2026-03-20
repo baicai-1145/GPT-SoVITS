@@ -460,11 +460,11 @@ class TTS:
         self.prepare_ref_semantic_batch_worker = None
         self.prepare_text_cpu_worker = None
         # Default on: request-local text CPU preprocessing blocks the event loop and serializes
-        # prepare_cpu_stage under high concurrency. Two workers still preserve large-batch formation
-        # while avoiding a single worker becoming the wall-clock bottleneck.
+        # prepare_cpu_stage under high concurrency. A single worker with a large high-pressure
+        # batch ceiling preserves super-batch formation better than multiple workers.
         self.prepare_text_cpu_workers = max(
             0,
-            int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_WORKERS", "2")),
+            int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_WORKERS", "1")),
         )
         self.prepare_text_cpu_executor = None
 
@@ -562,15 +562,15 @@ class TTS:
                 ),
                 worker_count=self.prepare_text_cpu_workers,
                 batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_WINDOW_MS", "2")),
-                max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_MAX_ITEMS", "32")),
+                max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_MAX_ITEMS", "512")),
                 high_pressure_pending_threshold=int(
-                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_PENDING_THRESHOLD", "0")
+                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_PENDING_THRESHOLD", "64")
                 ),
                 high_pressure_batch_window_ms=int(
                     os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_BATCH_WINDOW_MS", "4")
                 ),
                 high_pressure_max_batch_items=int(
-                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_MAX_ITEMS", "256")
+                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_MAX_ITEMS", "512")
                 ),
                 max_pending_tasks=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_MAX_PENDING_TASKS", "0")),
                 admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_ADMISSION_POLL_MS", "1")),
