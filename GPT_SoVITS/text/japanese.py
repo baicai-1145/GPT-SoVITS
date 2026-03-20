@@ -2,6 +2,7 @@
 import re
 import os
 import hashlib
+from functools import lru_cache
 
 try:
     import pyopenjtalk
@@ -171,12 +172,44 @@ def preprocess_jap(text, with_prosody=False):
     return text
 
 
+def preprocess_jap_batch(texts, with_prosody=False):
+    to_japanese = symbols_to_japanese
+    split_marks = _japanese_marks
+    match_chars = _japanese_characters.match
+    post_marks = post_replace_ph
+    use_prosody = bool(with_prosody)
+    if use_prosody:
+        phonemize_sentence = lambda sentence: pyopenjtalk_g2p_prosody(sentence)[1:-1]
+    else:
+        phonemize_sentence = lambda sentence: pyopenjtalk.g2p(sentence).split(" ")
+
+    rows = []
+    for raw_text in texts:
+        text = to_japanese(str(raw_text)).lower()
+        sentences = re.split(split_marks, text)
+        marks = re.findall(split_marks, text)
+        row = []
+        for index, sentence in enumerate(sentences):
+            if match_chars(sentence):
+                row.extend(phonemize_sentence(sentence))
+            if index < len(marks):
+                if marks[index] == " ":
+                    continue
+                row.append(post_marks(marks[index].replace(" ", "")))
+        rows.append(row)
+    return rows
+
+
 def text_normalize(text):
     # todo: jap text normalize
 
     # 避免重复标点引起的参考泄露
     text = replace_consecutive_punctuation(text)
     return text
+
+
+def text_normalize_batch(texts):
+    return [text_normalize(text) for text in texts]
 
 
 # Copied from espnet https://github.com/espnet/espnet/blob/master/espnet2/text/phoneme_tokenizer.py
@@ -264,11 +297,24 @@ def _numeric_feature_by_regex(regex, s):
     return int(match.group(1))
 
 
-def g2p(norm_text, with_prosody=True):
+@lru_cache(maxsize=8192)
+def _g2p_cached(norm_text: str, with_prosody: bool = True):
     phones = preprocess_jap(norm_text, with_prosody)
-    phones = [post_replace_ph(i) for i in phones]
-    # todo: implement tones and word2ph
-    return phones
+    return tuple(post_replace_ph(i) for i in phones)
+
+
+def g2p(norm_text, with_prosody=True):
+    return list(_g2p_cached(str(norm_text), bool(with_prosody)))
+
+
+def g2p_batch(norm_texts, with_prosody=True):
+    normalized_texts = [str(norm_text) for norm_text in norm_texts]
+    if not normalized_texts:
+        return []
+    if len(normalized_texts) == 1:
+        return [list(_g2p_cached(normalized_texts[0], bool(with_prosody)))]
+    rows = preprocess_jap_batch(normalized_texts, with_prosody=with_prosody)
+    return [[post_replace_ph(phone) for phone in row] for row in rows]
 
 
 if __name__ == "__main__":

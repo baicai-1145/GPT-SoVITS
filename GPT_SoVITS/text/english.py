@@ -1,6 +1,7 @@
 import pickle
 import os
 import re
+from functools import lru_cache
 import wordsegment
 from g2p_en import G2p
 
@@ -14,6 +15,7 @@ from nltk.tokenize import TweetTokenizer
 
 word_tokenize = TweetTokenizer().tokenize
 from nltk import pos_tag
+from nltk import pos_tag_sents
 
 current_file_path = os.path.dirname(__file__)
 CMU_DICT_PATH = os.path.join(current_file_path, "cmudict.rep")
@@ -31,6 +33,8 @@ rep_map = {
     "！": "!",
     "？": "?",
 }
+
+_TEXT_NORMALIZE_PATTERN = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
 
 
 arpa = {
@@ -230,19 +234,20 @@ def get_namedict():
     return name_dict
 
 
-def text_normalize(text):
-    # todo: eng text normalize
-
-    # 效果相同，和 chinese.py 保持一致
-    pattern = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
-    text = pattern.sub(lambda x: rep_map[x.group()], text)
-
+@lru_cache(maxsize=8192)
+def _text_normalize_cached(text: str):
+    text = _TEXT_NORMALIZE_PATTERN.sub(lambda x: rep_map[x.group()], str(text))
     text = unicode(text)
     text = normalize(text)
+    return replace_consecutive_punctuation(text)
 
-    # 避免重复标点引起的参考泄露
-    text = replace_consecutive_punctuation(text)
-    return text
+
+def text_normalize(text):
+    return _text_normalize_cached(str(text))
+
+
+def text_normalize_batch(texts):
+    return [text_normalize(text) for text in texts]
 
 
 class en_G2p(G2p):
@@ -268,11 +273,10 @@ class en_G2p(G2p):
         )
 
     def __call__(self, text):
-        # tokenization
         words = word_tokenize(text)
-        tokens = pos_tag(words)  # tuples of (word, tag)
+        return self._phonemize_tagged_tokens(pos_tag(words))
 
-        # steps
+    def _phonemize_tagged_tokens(self, tokens):
         prons = []
         for o_word, pos in tokens:
             # 还原 g2p_en 小写操作逻辑
@@ -305,6 +309,11 @@ class en_G2p(G2p):
             prons.extend([" "])
 
         return prons[:-1]
+
+    def batch(self, texts):
+        tokenized_sentences = [word_tokenize(text) for text in texts]
+        tagged_sentences = pos_tag_sents(tokenized_sentences)
+        return [self._phonemize_tagged_tokens(tokens) for tokens in tagged_sentences]
 
     def qryword(self, o_word):
         word = o_word.lower()
@@ -360,12 +369,27 @@ class en_G2p(G2p):
 _g2p = en_G2p()
 
 
-def g2p(text):
-    # g2p_en 整段推理，剔除不存在的arpa返回
-    phone_list = _g2p(text)
+def _postprocess_phone_list(phone_list):
     phones = [ph if ph != "<unk>" else "UNK" for ph in phone_list if ph not in [" ", "<pad>", "UW", "</s>", "<s>"]]
+    return tuple(replace_phs(phones))
 
-    return replace_phs(phones)
+
+@lru_cache(maxsize=8192)
+def _g2p_cached(text: str):
+    return _postprocess_phone_list(_g2p(str(text)))
+
+
+def g2p(text):
+    return list(_g2p_cached(str(text)))
+
+
+def g2p_batch(texts):
+    normalized_texts = [str(text) for text in texts]
+    if not normalized_texts:
+        return []
+    if len(normalized_texts) == 1:
+        return [list(_g2p_cached(normalized_texts[0]))]
+    return [list(_postprocess_phone_list(phone_list)) for phone_list in _g2p.batch(normalized_texts)]
 
 
 if __name__ == "__main__":

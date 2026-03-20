@@ -270,6 +270,12 @@ class PrepareTextCpuWorker:
             deadline = time.perf_counter() + batch_window_s
 
             while len(batch) < max_batch_items:
+                next_batch_window_s, next_max_batch_items, next_use_high_pressure = self._select_batch_policy_locked()
+                if next_use_high_pressure:
+                    if not use_high_pressure:
+                        deadline = max(deadline, time.perf_counter() + next_batch_window_s)
+                    max_batch_items = max(max_batch_items, next_max_batch_items)
+                    use_high_pressure = True
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0.0:
                     break

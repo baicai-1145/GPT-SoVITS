@@ -1,6 +1,7 @@
 # reference: https://github.com/ORI-Muchim/MB-iSTFT-VITS-Korean/blob/main/text/korean.py
 
 import re
+from functools import lru_cache
 from jamo import h2j, j2hcj
 import ko_pron
 from g2pk2 import G2p
@@ -431,6 +432,38 @@ def g2p(text):
     # text = "".join([post_replace_ph(i) for i in text])
     text = [post_replace_ph(i) for i in text]
     return text
+
+
+@lru_cache(maxsize=8192)
+def _g2p_cached(text: str):
+    return tuple(g2p(str(text)))
+
+
+def _g2p_batch_uncached(texts):
+    to_hangul = latin_to_hangul
+    convert = _g2p
+    divide = divide_hangul
+    fix = fix_g2pk2_error
+    tail_pattern = _TAIL_JAMO_PATTERN
+    replace_phone = post_replace_ph
+    rows = []
+    for text in texts:
+        value = to_hangul(str(text))
+        value = convert(value)
+        value = divide(value)
+        value = fix(value)
+        value = tail_pattern.sub(r"\1.", value)
+        rows.append([replace_phone(char) for char in value])
+    return rows
+
+
+def g2p_batch(texts):
+    normalized_texts = [str(text) for text in texts]
+    if not normalized_texts:
+        return []
+    if len(normalized_texts) == 1:
+        return [list(_g2p_cached(normalized_texts[0]))]
+    return _g2p_batch_uncached(normalized_texts)
 
 
 if __name__ == "__main__":
