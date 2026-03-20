@@ -1,6 +1,7 @@
 # reference: https://huggingface.co/spaces/Naozumi0512/Bert-VITS2-Cantonese-Yue/blob/main/text/chinese.py
 
 import re
+import threading
 import cn2an
 import ToJyutping
 
@@ -90,26 +91,31 @@ rep_map = {
     "「": "'",
     "」": "'",
 }
+_REP_PATTERN = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
+_ZH_ONLY_PATTERN = re.compile(r"[^\u4e00-\u9fa5" + "".join(punctuation) + r"]+")
+_THREAD_LOCAL = threading.local()
 
 
 def replace_punctuation(text):
     # text = text.replace("嗯", "恩").replace("呣", "母")
-    pattern = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
-
-    replaced_text = pattern.sub(lambda x: rep_map[x.group()], text)
-
-    replaced_text = re.sub(r"[^\u4e00-\u9fa5" + "".join(punctuation) + r"]+", "", replaced_text)
+    replaced_text = _REP_PATTERN.sub(lambda x: rep_map[x.group()], text)
+    replaced_text = _ZH_ONLY_PATTERN.sub("", replaced_text)
 
     return replaced_text
 
 
+def _get_text_normalizer() -> TextNormalizer:
+    normalizer = getattr(_THREAD_LOCAL, "text_normalizer", None)
+    if normalizer is None:
+        normalizer = TextNormalizer()
+        _THREAD_LOCAL.text_normalizer = normalizer
+    return normalizer
+
+
 def text_normalize(text):
-    tx = TextNormalizer()
+    tx = _get_text_normalizer()
     sentences = tx.normalize(text)
-    dest_text = ""
-    for sentence in sentences:
-        dest_text += replace_punctuation(sentence)
-    return dest_text
+    return "".join(replace_punctuation(sentence) for sentence in sentences)
 
 
 punctuation_set = set(punctuation)

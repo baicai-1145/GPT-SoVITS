@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import time
 
 import cn2an
@@ -56,17 +57,35 @@ rep_map = {
     "~": "…",
     "～": "…",
 }
+_REP_PATTERN = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
+_ZH_ONLY_PATTERN = re.compile(r"[^\u4e00-\u9fa5" + "".join(punctuation) + r"]+")
+_ZH_EN_PATTERN = re.compile(r"[^\u4e00-\u9fa5A-Za-z" + "".join(punctuation) + r"]+")
+_PUNCTUATION_CHARS = "".join(re.escape(p) for p in punctuation)
+_PUNCTUATIONS_PATTERN = re.compile(f"([{_PUNCTUATION_CHARS}])([{_PUNCTUATION_CHARS}])+")
 
 tone_modifier = ToneSandhi()
+_THREAD_LOCAL = threading.local()
+
+
+def _get_text_normalizer() -> TextNormalizer:
+    normalizer = getattr(_THREAD_LOCAL, "text_normalizer", None)
+    if normalizer is None:
+        normalizer = TextNormalizer()
+        _THREAD_LOCAL.text_normalizer = normalizer
+    return normalizer
+
+
+def _normalize_text_with_cached_normalizer(text: str) -> str:
+    normalizer = _get_text_normalizer()
+    sentences = normalizer.normalize(text)
+    dest_text = "".join(replace_punctuation(sentence) for sentence in sentences)
+    return replace_consecutive_punctuation(dest_text)
 
 
 def replace_punctuation(text):
     text = text.replace("嗯", "恩").replace("呣", "母")
-    pattern = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
-
-    replaced_text = pattern.sub(lambda x: rep_map[x.group()], text)
-
-    replaced_text = re.sub(r"[^\u4e00-\u9fa5" + "".join(punctuation) + r"]+", "", replaced_text)
+    replaced_text = _REP_PATTERN.sub(lambda x: rep_map[x.group()], text)
+    replaced_text = _ZH_ONLY_PATTERN.sub("", replaced_text)
 
     return replaced_text
 
@@ -388,33 +407,29 @@ def _g2p(segments):
 
 def replace_punctuation_with_en(text):
     text = text.replace("嗯", "恩").replace("呣", "母")
-    pattern = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
-
-    replaced_text = pattern.sub(lambda x: rep_map[x.group()], text)
-
-    replaced_text = re.sub(r"[^\u4e00-\u9fa5A-Za-z" + "".join(punctuation) + r"]+", "", replaced_text)
+    replaced_text = _REP_PATTERN.sub(lambda x: rep_map[x.group()], text)
+    replaced_text = _ZH_EN_PATTERN.sub("", replaced_text)
 
     return replaced_text
 
 
 def replace_consecutive_punctuation(text):
-    punctuations = "".join(re.escape(p) for p in punctuation)
-    pattern = f"([{punctuations}])([{punctuations}])+"
-    result = re.sub(pattern, r"\1", text)
-    return result
+    return _PUNCTUATIONS_PATTERN.sub(r"\1", text)
 
 
 def text_normalize(text):
     # https://github.com/PaddlePaddle/PaddleSpeech/tree/develop/paddlespeech/t2s/frontend/zh_normalization
-    tx = TextNormalizer()
-    sentences = tx.normalize(text)
-    dest_text = ""
-    for sentence in sentences:
-        dest_text += replace_punctuation(sentence)
+    return _normalize_text_with_cached_normalizer(text)
 
-    # 避免重复标点引起的参考泄露
-    dest_text = replace_consecutive_punctuation(dest_text)
-    return dest_text
+
+def text_normalize_batch(texts):
+    normalizer = _get_text_normalizer()
+    results = []
+    for text in texts:
+        sentences = normalizer.normalize(text)
+        dest_text = "".join(replace_punctuation(sentence) for sentence in sentences)
+        results.append(replace_consecutive_punctuation(dest_text))
+    return results
 
 
 if __name__ == "__main__":

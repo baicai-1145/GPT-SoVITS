@@ -20,8 +20,11 @@ from text.cleaner import clean_text
 from text import cleaned_text_to_sequence
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 from TTS_infer_pack.text_segmentation_method import split_big_text, splits, get_method as get_seg_method
-from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker
-from TTS_infer_pack.text_cpu_preprocess import preprocess_text_segments_payload
+from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker, PrepareBertBatchWorkerPool
+from TTS_infer_pack.text_cpu_preprocess import (
+    preprocess_text_segments_payload,
+    preprocess_text_segments_payload_batch,
+)
 
 from tools.i18n.i18n import I18nAuto, scan_language_list
 
@@ -112,7 +115,7 @@ class TextPreprocessor:
         device: torch.device,
         version: str = "v2",
         bert_stage_limiter: StageLimiter | None = None,
-        bert_batch_worker: PrepareBertBatchWorker | None = None,
+        bert_batch_worker: PrepareBertBatchWorker | PrepareBertBatchWorkerPool | None = None,
     ):
         self.bert_model = bert_model
         self.tokenizer = tokenizer
@@ -258,6 +261,23 @@ class TextPreprocessor:
         final: bool = False,
     ) -> List[PreparedTextSegment]:
         payloads = preprocess_text_segments_payload(text, language, version, final=final)
+        return self._payloads_to_prepared_segments(payloads)
+
+    def preprocess_text_segments_batch(
+        self,
+        items: List[Tuple[str, str]],
+        version: str,
+        final: bool = False,
+    ) -> List[List[PreparedTextSegment]]:
+        payload_batches = preprocess_text_segments_payload_batch(
+            [(text, language, version, final) for text, language in items]
+        )
+        return [self._payloads_to_prepared_segments(payloads) for payloads in payload_batches]
+
+    @staticmethod
+    def _payloads_to_prepared_segments(
+        payloads: List[Dict[str, object]],
+    ) -> List[PreparedTextSegment]:
         return [
             PreparedTextSegment(
                 language=str(payload["language"]),
@@ -359,8 +379,18 @@ class TextPreprocessor:
         self._accumulate_profile(profile, "bert_queue_wait_ms", worker_profile.get("bert_queue_wait_ms", 0.0))
         self._accumulate_profile(
             profile,
+            "bert_worker_queue_wait_ms",
+            worker_profile.get("bert_worker_queue_wait_ms", 0.0),
+        )
+        self._accumulate_profile(
+            profile,
             "bert_batch_collect_wait_ms",
             worker_profile.get("bert_batch_collect_wait_ms", 0.0),
+        )
+        self._accumulate_profile(
+            profile,
+            "bert_batch_dispatch_delay_ms",
+            worker_profile.get("bert_batch_dispatch_delay_ms", 0.0),
         )
         self._accumulate_profile(profile, "bert_forward_ms", worker_profile.get("bert_forward_ms", 0.0))
         self._accumulate_profile(profile, "bert_tokenize_ms", worker_profile.get("bert_tokenize_ms", 0.0))
@@ -384,13 +414,26 @@ class TextPreprocessor:
             profile["bert_stage_slots"] = float(worker_profile.get("bert_stage_slots", 0.0))
             profile["bert_batch_window_ms"] = float(worker_profile.get("bert_batch_window_ms", 0.0))
 
+    def _mark_bert_submit_offsets(self, profile: Dict | None) -> None:
+        if profile is None:
+            return
+        branch_start_ts = float(profile.get("_branch_start_ts", 0.0) or 0.0)
+        if branch_start_ts <= 0.0:
+            return
+        offset_ms = max(0.0, (time.perf_counter() - branch_start_ts) * 1000.0)
+        if "bert_submit_offset_first_ms" not in profile:
+            profile["bert_submit_offset_first_ms"] = float(offset_ms)
+        profile["bert_submit_offset_last_ms"] = float(offset_ms)
+
     def get_bert_feature(self, text: str, word2ph: list, profile: Dict | None = None) -> torch.Tensor:
         if self.bert_batch_worker is not None:
+            self._mark_bert_submit_offsets(profile)
             feature, worker_profile = self.bert_batch_worker.submit(text, word2ph)
             self._merge_bert_worker_profile(profile, worker_profile)
             return feature
 
         limiter_stats = {"wait_ms": 0.0, "inflight": 1, "peak_inflight": 1, "slots": 0}
+        self._mark_bert_submit_offsets(profile)
         if self.bert_stage_limiter is None:
             forward_start = time.perf_counter()
             with torch.no_grad():
@@ -497,6 +540,7 @@ class TextPreprocessor:
             if segment_language == "zh" and self.bert_batch_worker is not None:
                 if segment.word2ph is None:
                     raise ValueError("中文文本缺少 word2ph，无法提取 BERT 特征")
+                self._mark_bert_submit_offsets(profile)
                 bert_list.append(None)
                 continue
             bert_list.append(

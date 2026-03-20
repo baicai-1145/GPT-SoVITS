@@ -10,6 +10,8 @@ from typing import Deque, Dict, List, Tuple
 import torch
 import torchaudio
 
+from TTS_infer_pack.prepare_gpu_timeline import sync_timeline_cuda, trace_gpu_batch
+
 
 REF_AUDIO_MIN_SAMPLES_16K = 48000
 REF_AUDIO_MAX_SAMPLES_16K = 160000
@@ -114,6 +116,7 @@ class PrepareRefSemanticBatchWorker:
         batch_window_ms: int = 5,
         max_batch_items: int = 8,
         max_batch_samples: int = 960000,
+        shard_index: int = 0,
     ):
         self.ssl_model = ssl_model
         self.vits_model = vits_model
@@ -124,6 +127,7 @@ class PrepareRefSemanticBatchWorker:
         self.batch_window_s = max(0.0, float(batch_window_ms) / 1000.0)
         self.max_batch_items = max(1, int(max_batch_items))
         self.max_batch_samples = max(REF_AUDIO_MIN_SAMPLES_16K + self.zero_wav_samples, int(max_batch_samples))
+        self.shard_index = int(shard_index)
 
         self.condition = threading.Condition()
         self.pending_tasks: Deque[RefSemanticTask] = deque()
@@ -137,10 +141,27 @@ class PrepareRefSemanticBatchWorker:
         self.active_batch_samples_peak = 0
         self.worker_thread = threading.Thread(
             target=self._run_loop,
-            name="prepare-ref-semantic-batch-worker",
+            name=f"prepare-ref-semantic-batch-worker-{self.shard_index}",
             daemon=True,
         )
         self.worker_thread.start()
+
+    def pending_count(self) -> int:
+        with self.condition:
+            return int(len(self.pending_tasks))
+
+    def pending_samples(self) -> int:
+        with self.condition:
+            return int(sum(self._estimate_task_samples(task) for task in self.pending_tasks))
+
+    def outstanding_count(self) -> int:
+        with self.condition:
+            return int(len(self.pending_tasks) + self.active_batch_size)
+
+    def outstanding_samples(self) -> int:
+        with self.condition:
+            pending_samples = int(sum(self._estimate_task_samples(task) for task in self.pending_tasks))
+            return int(pending_samples + self.active_batch_samples)
 
     def _estimate_task_samples(self, task: RefSemanticTask) -> int:
         raw_len = int(task.raw_audio.shape[-1]) if task.raw_audio.dim() > 0 else 0
@@ -199,6 +220,7 @@ class PrepareRefSemanticBatchWorker:
     def snapshot(self) -> Dict[str, int]:
         with self.condition:
             return {
+                "shard_index": self.shard_index,
                 "pending": len(self.pending_tasks),
                 "pending_peak": self.pending_peak,
                 "total_submitted": self.total_submitted,
@@ -208,6 +230,10 @@ class PrepareRefSemanticBatchWorker:
                 "active_batch_peak": self.active_batch_peak,
                 "active_batch_samples": self.active_batch_samples,
                 "active_batch_samples_peak": self.active_batch_samples_peak,
+                "outstanding": len(self.pending_tasks) + self.active_batch_size,
+                "outstanding_samples": int(
+                    sum(self._estimate_task_samples(task) for task in self.pending_tasks) + self.active_batch_samples
+                ),
                 "batch_window_ms": int(self.batch_window_s * 1000.0),
                 "max_batch_items": self.max_batch_items,
                 "max_batch_samples": self.max_batch_samples,
@@ -272,6 +298,7 @@ class PrepareRefSemanticBatchWorker:
         prepared_wavs = [
             prepare_prompt_semantic_wav16k(task.raw_audio, int(task.raw_sr), self.zero_wav_samples) for task in batch
         ]
+        prepared_end = time.perf_counter()
         cpu_prepare_ms = (time.perf_counter() - prepared_start) * 1000.0
         wav_lengths = torch.tensor([int(wav.shape[0]) for wav in prepared_wavs], dtype=torch.long)
         batch_samples = int(wav_lengths.sum().item())
@@ -284,51 +311,81 @@ class PrepareRefSemanticBatchWorker:
             wav_len = int(wav.shape[0])
             input_values_cpu[batch_index, :wav_len] = wav
             attention_mask_cpu[batch_index, :wav_len] = 1
-        pack_ms = (time.perf_counter() - pack_start) * 1000.0
+        pack_end = time.perf_counter()
+        pack_ms = (pack_end - pack_start) * 1000.0
 
         limiter_stats = {"wait_ms": 0.0, "peak_inflight": 1, "slots": 0}
         h2d_ms = 0.0
         ssl_forward_ms = 0.0
         hidden_length_ms = 0.0
         extract_latent_ms = 0.0
+        gpu_acquired_ts = pack_end
+        h2d_start_ts = pack_end
+        h2d_end_ts = pack_end
+        ssl_start_ts = pack_end
+        ssl_end_ts = pack_end
+        latent_start_ts = pack_end
+        latent_end_ts = pack_end
         if self.stage_limiter is None:
             h2d_start = time.perf_counter()
+            h2d_start_ts = h2d_start
             input_values = input_values_cpu.to(self.device)
             attention_mask = attention_mask_cpu.to(self.device)
             if self.is_half:
                 input_values = input_values.half()
-            h2d_ms = (time.perf_counter() - h2d_start) * 1000.0
-            ssl_start = time.perf_counter()
-            outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
-            ssl_forward_ms = (time.perf_counter() - ssl_start) * 1000.0
-            hubert_feature = outputs["last_hidden_state"].transpose(1, 2)
-            hidden_length_start = time.perf_counter()
-            hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
-            hidden_length_ms = (time.perf_counter() - hidden_length_start) * 1000.0
-            latent_start = time.perf_counter()
-            codes = self.vits_model.extract_latent(hubert_feature)
-            extract_latent_ms = (time.perf_counter() - latent_start) * 1000.0
-        else:
-            with self.stage_limiter.enter() as limiter_stats:
-                h2d_start = time.perf_counter()
-                input_values = input_values_cpu.to(self.device)
-                attention_mask = attention_mask_cpu.to(self.device)
-                if self.is_half:
-                    input_values = input_values.half()
-                h2d_ms = (time.perf_counter() - h2d_start) * 1000.0
+            h2d_end_ts = time.perf_counter()
+            h2d_ms = (h2d_end_ts - h2d_start) * 1000.0
+            gpu_acquired_ts = h2d_start_ts
+            with torch.inference_mode():
                 ssl_start = time.perf_counter()
+                ssl_start_ts = ssl_start
                 outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
-                ssl_forward_ms = (time.perf_counter() - ssl_start) * 1000.0
+                sync_timeline_cuda(self.device)
+                ssl_end_ts = time.perf_counter()
+                ssl_forward_ms = (ssl_end_ts - ssl_start) * 1000.0
                 hubert_feature = outputs["last_hidden_state"].transpose(1, 2)
                 hidden_length_start = time.perf_counter()
                 hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
                 hidden_length_ms = (time.perf_counter() - hidden_length_start) * 1000.0
                 latent_start = time.perf_counter()
+                latent_start_ts = latent_start
                 codes = self.vits_model.extract_latent(hubert_feature)
-                extract_latent_ms = (time.perf_counter() - latent_start) * 1000.0
+                sync_timeline_cuda(self.device)
+                latent_end_ts = time.perf_counter()
+                extract_latent_ms = (latent_end_ts - latent_start) * 1000.0
+        else:
+            with self.stage_limiter.enter() as limiter_stats:
+                gpu_acquired_ts = time.perf_counter()
+                h2d_start = gpu_acquired_ts
+                h2d_start_ts = h2d_start
+                input_values = input_values_cpu.to(self.device)
+                attention_mask = attention_mask_cpu.to(self.device)
+                if self.is_half:
+                    input_values = input_values.half()
+                h2d_end_ts = time.perf_counter()
+                h2d_ms = (h2d_end_ts - h2d_start) * 1000.0
+                with torch.inference_mode():
+                    ssl_start = time.perf_counter()
+                    ssl_start_ts = ssl_start
+                    outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
+                    sync_timeline_cuda(self.device)
+                    ssl_end_ts = time.perf_counter()
+                    ssl_forward_ms = (ssl_end_ts - ssl_start) * 1000.0
+                    hubert_feature = outputs["last_hidden_state"].transpose(1, 2)
+                    hidden_length_start = time.perf_counter()
+                    hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
+                    hidden_length_ms = (time.perf_counter() - hidden_length_start) * 1000.0
+                    latent_start = time.perf_counter()
+                    latent_start_ts = latent_start
+                    codes = self.vits_model.extract_latent(hubert_feature)
+                    sync_timeline_cuda(self.device)
+                    latent_end_ts = time.perf_counter()
+                    extract_latent_ms = (latent_end_ts - latent_start) * 1000.0
         forward_ms = float(h2d_ms + ssl_forward_ms + hidden_length_ms + extract_latent_ms)
 
         code_lengths = conv1d_output_lengths(hidden_lengths.detach().cpu(), getattr(self.vits_model, "ssl_proj", None))
+        sync_timeline_cuda(self.device)
+        gpu_active_end_ts = time.perf_counter()
         scatter_start = time.perf_counter()
         for batch_index, task in enumerate(batch):
             try:
@@ -341,6 +398,7 @@ class PrepareRefSemanticBatchWorker:
                     "prompt_semantic_wait_ms": worker_queue_wait_ms
                     + batch_collect_wait_ms
                     + stage_limiter_wait_ms,
+                    "prompt_semantic_shard_index": float(self.shard_index),
                     "prompt_semantic_worker_queue_wait_ms": worker_queue_wait_ms,
                     "prompt_semantic_batch_collect_wait_ms": batch_collect_wait_ms,
                     "prompt_semantic_stage_limiter_wait_ms": stage_limiter_wait_ms,
@@ -364,10 +422,51 @@ class PrepareRefSemanticBatchWorker:
             except Exception as exc:  # noqa: PERF203
                 task.error = exc
         scatter_ms = (time.perf_counter() - scatter_start) * 1000.0
+        batch_finished_ts = time.perf_counter()
+        avg_queue_wait_ms = 0.0
+        if batch:
+            avg_queue_wait_ms = float(
+                sum(max(0.0, (float(task.batch_popped_at) - float(task.created_at)) * 1000.0) for task in batch)
+                / len(batch)
+            )
+        notify_start = time.perf_counter()
         for task in batch:
             if task.result_prompt_semantic is not None:
                 task.profile["prompt_semantic_scatter_ms"] = float(scatter_ms)
             self._notify_task_done(task)
+        notify_end = time.perf_counter()
+        notify_ms = (notify_end - notify_start) * 1000.0
+        trace_gpu_batch(
+            "ref_gpu_batch",
+            stage="ref_semantic",
+            shard_index=int(self.shard_index),
+            batch_size=int(len(batch)),
+            batch_samples=int(batch_samples),
+            limiter_wait_ms=float(limiter_stats["wait_ms"]),
+            queue_wait_ms=float(avg_queue_wait_ms),
+            cpu_prepare_ms=float(cpu_prepare_ms),
+            pack_ms=float(pack_ms),
+            h2d_ms=float(h2d_ms),
+            ssl_forward_ms=float(ssl_forward_ms),
+            hidden_length_ms=float(hidden_length_ms),
+            extract_latent_ms=float(extract_latent_ms),
+            scatter_ms=float(scatter_ms),
+            notify_ms=float(notify_ms),
+            batch_collected_ts=float(batch_collected_at),
+            batch_started_ts=batch_started,
+            batch_finished_ts=batch_finished_ts,
+            notify_end_ts=notify_end,
+            gpu_acquired_ts=gpu_acquired_ts,
+            gpu_active_start_ts=h2d_start_ts,
+            h2d_end_ts=h2d_end_ts,
+            ssl_start_ts=ssl_start_ts,
+            ssl_end_ts=ssl_end_ts,
+            latent_start_ts=latent_start_ts,
+            latent_end_ts=latent_end_ts,
+            gpu_active_end_ts=gpu_active_end_ts,
+            cpu_prepare_end_ts=prepared_end,
+            pack_end_ts=pack_end,
+        )
 
     def _run_loop(self) -> None:
         while True:
@@ -380,3 +479,85 @@ class PrepareRefSemanticBatchWorker:
                     self._notify_task_done(task)
             finally:
                 self._finalize_batch(batch)
+
+
+class PrepareRefSemanticBatchWorkerPool:
+    def __init__(
+        self,
+        ssl_model,
+        vits_model,
+        device,
+        is_half: bool,
+        zero_wav_samples: int,
+        stage_limiter=None,
+        batch_window_ms: int = 5,
+        max_batch_items: int = 8,
+        max_batch_samples: int = 960000,
+        worker_count: int = 1,
+    ):
+        self.worker_count = max(1, int(worker_count))
+        self.lock = threading.Lock()
+        self.shards = [
+            PrepareRefSemanticBatchWorker(
+                ssl_model=ssl_model,
+                vits_model=vits_model,
+                device=device,
+                is_half=is_half,
+                zero_wav_samples=zero_wav_samples,
+                stage_limiter=stage_limiter,
+                batch_window_ms=batch_window_ms,
+                max_batch_items=max_batch_items,
+                max_batch_samples=max_batch_samples,
+                shard_index=index,
+            )
+            for index in range(self.worker_count)
+        ]
+
+    def _pick_shard(self) -> PrepareRefSemanticBatchWorker:
+        with self.lock:
+            return min(
+                self.shards,
+                key=lambda shard: (
+                    shard.outstanding_count(),
+                    shard.outstanding_samples(),
+                    shard.snapshot().get("active_batch_size", 0),
+                    shard.shard_index,
+                ),
+            )
+
+    def submit(self, raw_audio: torch.Tensor, raw_sr: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        shard = self._pick_shard()
+        result, profile = shard.submit(raw_audio, raw_sr)
+        profile["prompt_semantic_pool_workers"] = float(self.worker_count)
+        return result, profile
+
+    async def submit_async(self, raw_audio: torch.Tensor, raw_sr: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        shard = self._pick_shard()
+        result, profile = await shard.submit_async(raw_audio, raw_sr)
+        profile["prompt_semantic_pool_workers"] = float(self.worker_count)
+        return result, profile
+
+    def snapshot(self) -> Dict[str, int | List[Dict[str, int]]]:
+        shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]
+        return {
+            "worker_count": int(self.worker_count),
+            "pending": int(sum(int(snapshot.get("pending", 0)) for snapshot in shard_snapshots)),
+            "pending_peak": int(max((int(snapshot.get("pending_peak", 0)) for snapshot in shard_snapshots), default=0)),
+            "outstanding": int(sum(int(snapshot.get("outstanding", 0)) for snapshot in shard_snapshots)),
+            "outstanding_samples": int(sum(int(snapshot.get("outstanding_samples", 0)) for snapshot in shard_snapshots)),
+            "total_submitted": int(sum(int(snapshot.get("total_submitted", 0)) for snapshot in shard_snapshots)),
+            "total_finished": int(sum(int(snapshot.get("total_finished", 0)) for snapshot in shard_snapshots)),
+            "total_batches": int(sum(int(snapshot.get("total_batches", 0)) for snapshot in shard_snapshots)),
+            "active_batch_size": int(sum(int(snapshot.get("active_batch_size", 0)) for snapshot in shard_snapshots)),
+            "active_batch_peak": int(
+                max((int(snapshot.get("active_batch_peak", 0)) for snapshot in shard_snapshots), default=0)
+            ),
+            "active_batch_samples": int(sum(int(snapshot.get("active_batch_samples", 0)) for snapshot in shard_snapshots)),
+            "active_batch_samples_peak": int(
+                max((int(snapshot.get("active_batch_samples_peak", 0)) for snapshot in shard_snapshots), default=0)
+            ),
+            "batch_window_ms": int(shard_snapshots[0].get("batch_window_ms", 0)) if shard_snapshots else 0,
+            "max_batch_items": int(shard_snapshots[0].get("max_batch_items", 0)) if shard_snapshots else 0,
+            "max_batch_samples": int(shard_snapshots[0].get("max_batch_samples", 0)) if shard_snapshots else 0,
+            "shards": shard_snapshots,
+        }

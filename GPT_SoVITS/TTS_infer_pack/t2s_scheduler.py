@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -149,6 +152,7 @@ def prepare_text_features(
     device = tts.configs.device
     profile: Dict[str, float] = {}
     branch_start = time.perf_counter()
+    profile["_branch_start_ts"] = float(branch_start)
     _sync_device(device)
     cpu_start = time.perf_counter()
     prepared_segments = tts.prepare_text_segments(text, language)
@@ -160,6 +164,7 @@ def prepare_text_features(
     _sync_device(device)
     profile["bert_total_ms"] = (time.perf_counter() - bert_start) * 1000.0
     total_ms = (time.perf_counter() - branch_start) * 1000.0
+    profile.pop("_branch_start_ts", None)
     return PreparedTextFeatures(
         phones=phones,
         bert_features=bert_features,
@@ -226,7 +231,19 @@ def build_request_state_from_parts(
         "prompt_text_bert_wait_ms": float(prompt_result.profile.get("bert_wait_ms", 0.0)),
         "prompt_text_bert_admission_wait_ms": float(prompt_result.profile.get("bert_admission_wait_ms", 0.0)),
         "prompt_text_bert_queue_wait_ms": float(prompt_result.profile.get("bert_queue_wait_ms", 0.0)),
+        "prompt_text_bert_worker_queue_wait_ms": float(
+            prompt_result.profile.get("bert_worker_queue_wait_ms", 0.0)
+        ),
+        "prompt_text_bert_submit_offset_first_ms": float(
+            prompt_result.profile.get("bert_submit_offset_first_ms", 0.0)
+        ),
+        "prompt_text_bert_submit_offset_last_ms": float(
+            prompt_result.profile.get("bert_submit_offset_last_ms", 0.0)
+        ),
         "prompt_text_bert_batch_collect_wait_ms": float(prompt_result.profile.get("bert_batch_collect_wait_ms", 0.0)),
+        "prompt_text_bert_batch_dispatch_delay_ms": float(
+            prompt_result.profile.get("bert_batch_dispatch_delay_ms", 0.0)
+        ),
         "prompt_text_bert_forward_ms": float(prompt_result.profile.get("bert_forward_ms", 0.0)),
         "prompt_text_bert_tokenize_ms": float(prompt_result.profile.get("bert_tokenize_ms", 0.0)),
         "prompt_text_bert_scatter_ms": float(prompt_result.profile.get("bert_scatter_ms", 0.0)),
@@ -272,7 +289,11 @@ def build_request_state_from_parts(
         "text_bert_wait_ms": float(target_result.profile.get("bert_wait_ms", 0.0)),
         "text_bert_admission_wait_ms": float(target_result.profile.get("bert_admission_wait_ms", 0.0)),
         "text_bert_queue_wait_ms": float(target_result.profile.get("bert_queue_wait_ms", 0.0)),
+        "text_bert_worker_queue_wait_ms": float(target_result.profile.get("bert_worker_queue_wait_ms", 0.0)),
+        "text_bert_submit_offset_first_ms": float(target_result.profile.get("bert_submit_offset_first_ms", 0.0)),
+        "text_bert_submit_offset_last_ms": float(target_result.profile.get("bert_submit_offset_last_ms", 0.0)),
         "text_bert_batch_collect_wait_ms": float(target_result.profile.get("bert_batch_collect_wait_ms", 0.0)),
+        "text_bert_batch_dispatch_delay_ms": float(target_result.profile.get("bert_batch_dispatch_delay_ms", 0.0)),
         "text_bert_forward_ms": float(target_result.profile.get("bert_forward_ms", 0.0)),
         "text_bert_tokenize_ms": float(target_result.profile.get("bert_tokenize_ms", 0.0)),
         "text_bert_scatter_ms": float(target_result.profile.get("bert_scatter_ms", 0.0)),
@@ -309,6 +330,8 @@ def build_request_state_from_parts(
         "audio_stage_inflight_peak": float(bundle_profile.get("audio_stage_inflight_peak", 0.0)),
         "prompt_semantic_ms": prompt_semantic_ms,
         "prompt_semantic_wait_ms": float(bundle_profile.get("prompt_semantic_wait_ms", 0.0)),
+        "prompt_semantic_submit_offset_ms": float(bundle_profile.get("prompt_semantic_submit_offset_ms", 0.0)),
+        "prompt_semantic_submit_after_load_ms": float(bundle_profile.get("prompt_semantic_submit_after_load_ms", 0.0)),
         "prompt_semantic_cpu_prepare_wait_ms": float(bundle_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)),
         "prompt_semantic_cpu_prepare_slots": float(bundle_profile.get("prompt_semantic_cpu_prepare_slots", 0.0)),
         "prompt_semantic_cpu_prepare_inflight_peak": float(
@@ -338,6 +361,8 @@ def build_request_state_from_parts(
         "prompt_semantic_stage_inflight_peak": float(bundle_profile.get("prompt_semantic_stage_inflight_peak", 0.0)),
         "prompt_semantic_batch_size": float(bundle_profile.get("prompt_semantic_batch_size", 0.0)),
         "prompt_semantic_batch_samples": float(bundle_profile.get("prompt_semantic_batch_samples", 0.0)),
+        "prompt_semantic_pool_workers": float(bundle_profile.get("prompt_semantic_pool_workers", 0.0)),
+        "prompt_semantic_shard_index": float(bundle_profile.get("prompt_semantic_shard_index", 0.0)),
         "ref_spec_wait_ms": float(bundle_profile.get("ref_spec_wait_ms", 0.0)),
         "ref_spec_ms": ref_spec_ms,
         "ref_spec_to_device_ms": float(bundle_profile.get("ref_spec_to_device_ms", 0.0)),
@@ -380,8 +405,87 @@ def build_request_state_from_parts(
     )
 
 
+_SCHEDULER_PREPARE_COORDINATOR_ATTR = "_scheduler_prepare_coordinator"
+_SCHEDULER_PREPARE_COORDINATOR_LOCK_ATTR = "_scheduler_prepare_coordinator_lock"
+_SCHEDULER_PROMPT_EXECUTOR_ATTR = "_scheduler_prompt_text_executor"
+_SCHEDULER_PROMPT_EXECUTOR_LOCK_ATTR = "_scheduler_prompt_text_executor_lock"
+
+
+def _get_scheduler_prepare_coordinator(tts: Any):
+    coordinator = getattr(tts, _SCHEDULER_PREPARE_COORDINATOR_ATTR, None)
+    if coordinator is not None:
+        return coordinator
+    lock = getattr(tts, _SCHEDULER_PREPARE_COORDINATOR_LOCK_ATTR, None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(tts, _SCHEDULER_PREPARE_COORDINATOR_LOCK_ATTR, lock)
+    with lock:
+        coordinator = getattr(tts, _SCHEDULER_PREPARE_COORDINATOR_ATTR, None)
+        if coordinator is None:
+            from GPT_SoVITS.TTS_infer_pack.prepare_coordinator import PrepareCoordinator
+
+            coordinator = PrepareCoordinator(tts)
+            setattr(tts, _SCHEDULER_PREPARE_COORDINATOR_ATTR, coordinator)
+        return coordinator
+
+
+def _run_coro_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: Dict[str, Any] = {}
+    error: Dict[str, BaseException] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001
+            error["value"] = exc
+
+    thread = threading.Thread(target=_runner, name="prepare-request-state-sync", daemon=True)
+    thread.start()
+    thread.join()
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
+def _get_scheduler_prompt_text_executor(tts: Any):
+    executor = getattr(tts, _SCHEDULER_PROMPT_EXECUTOR_ATTR, None)
+    if executor is not None:
+        return executor
+    lock = getattr(tts, _SCHEDULER_PROMPT_EXECUTOR_LOCK_ATTR, None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(tts, _SCHEDULER_PROMPT_EXECUTOR_LOCK_ATTR, lock)
+    with lock:
+        executor = getattr(tts, _SCHEDULER_PROMPT_EXECUTOR_ATTR, None)
+        if executor is None:
+            worker_count = max(1, int(os.environ.get("GPTSOVITS_PREPARE_PROMPT_TEXT_WORKERS", "64")))
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="prepare-prompt-text",
+            )
+            setattr(tts, _SCHEDULER_PROMPT_EXECUTOR_ATTR, executor)
+        return executor
+
+
+def _run_profiled_prepare_text_features(
+    tts: Any,
+    text: str,
+    language: str,
+    submit_at: float,
+) -> tuple[PreparedTextFeatures, float, float, float]:
+    started_at = time.perf_counter()
+    result = prepare_text_features(tts, text, language)
+    finished_at = time.perf_counter()
+    return result, float(submit_at), float(started_at), float(finished_at)
+
+
 @torch.inference_mode()
-def prepare_request_state(
+def _prepare_request_state_legacy(
     tts: Any,
     spec: SchedulerRequestSpec,
 ) -> T2SRequestState:
@@ -389,7 +493,24 @@ def prepare_request_state(
     prepare_sync_start = time.perf_counter()
     prompt_text = normalize_sentence(spec.prompt_text, spec.prompt_lang)
     text = spec.text.strip("\n")
+    prompt_result = None
+    profile_overrides: Dict[str, float] = {}
+    prompt_future = None
+    prompt_async_enabled = (
+        prompt_text not in [None, ""]
+        and os.environ.get("GPTSOVITS_PREPARE_PROMPT_TEXT_ASYNC", "0") != "0"
+    )
+    if prompt_async_enabled:
+        prompt_submit_at = time.perf_counter()
+        prompt_future = _get_scheduler_prompt_text_executor(tts).submit(
+            _run_profiled_prepare_text_features,
+            tts,
+            prompt_text,
+            spec.prompt_lang,
+            float(prompt_submit_at),
+        )
     target_result = prepare_text_features(tts, text, spec.text_lang)
+    target_done_at = time.perf_counter()
     if target_result.phones is None:
         raise ValueError(f"{spec.request_id} text preprocessing returned no phones")
     if prompt_text in [None, ""]:
@@ -397,9 +518,32 @@ def prepare_request_state(
             feature_dim=int(target_result.bert_features.shape[0]),
             dtype=target_result.bert_features.dtype,
         )
-    else:
+    elif prompt_future is None:
         prompt_result = prepare_text_features(tts, prompt_text, spec.prompt_lang)
     ref_audio_bundle = tts.extract_ref_audio_bundle(str(spec.ref_audio_path))
+    if prompt_future is not None:
+        future_wait_start = time.perf_counter()
+        prompt_result, prompt_submit_at, prompt_started_at, prompt_finished_at = prompt_future.result()
+        future_wait_end = time.perf_counter()
+        profile_overrides = {
+            "prompt_text_parallel_future_wait_ms": max(0.0, (future_wait_end - future_wait_start) * 1000.0),
+            "prompt_text_parallel_future_executor_queue_ms": max(
+                0.0, (float(prompt_started_at) - float(prompt_submit_at)) * 1000.0
+            ),
+            "prompt_text_parallel_future_run_ms": max(
+                0.0, (float(prompt_finished_at) - float(prompt_started_at)) * 1000.0
+            ),
+            "prompt_text_parallel_future_finish_after_submit_ms": max(
+                0.0, (float(prompt_finished_at) - float(prompt_submit_at)) * 1000.0
+            ),
+            "prompt_text_parallel_future_queue_tail_after_target_ms": max(
+                0.0, (float(prompt_started_at) - float(target_done_at)) * 1000.0
+            ),
+            "prompt_text_parallel_future_run_tail_after_target_ms": max(
+                0.0, (float(prompt_finished_at) - max(float(prompt_started_at), float(target_done_at))) * 1000.0
+            ),
+        }
+    assert prompt_result is not None
     return build_request_state_from_parts(
         tts=tts,
         spec=spec,
@@ -410,7 +554,20 @@ def prepare_request_state(
         ref_audio_bundle=ref_audio_bundle,
         prepare_start=prepare_start,
         prepare_sync_start=prepare_sync_start,
+        profile_overrides=profile_overrides,
     )
+
+
+@torch.inference_mode()
+def prepare_request_state(
+    tts: Any,
+    spec: SchedulerRequestSpec,
+) -> T2SRequestState:
+    if os.environ.get("GPTSOVITS_PREPARE_SCHEDULER_USE_COORDINATOR", "0") == "0":
+        return _prepare_request_state_legacy(tts, spec)
+    coordinator = _get_scheduler_prepare_coordinator(tts)
+    state, _, _ = _run_coro_sync(coordinator.prepare_state_profiled_async(spec, time.perf_counter()))
+    return state
 
 
 def _left_pad_hidden(hidden: torch.Tensor, target_len: int) -> torch.Tensor:

@@ -111,7 +111,7 @@ class PrepareCoordinator:
         self.text_feature_workers = 0
         self.text_feature_executor = None
         if not self.use_async_text_feature_path:
-            text_feature_default_workers = max(1, int(getattr(tts, "prepare_text_cpu_workers", 16) or 16))
+            text_feature_default_workers = 16
             self.text_feature_workers = max(
                 1,
                 int(os.environ.get("GPTSOVITS_PREPARE_TEXT_FEATURE_WORKERS", str(text_feature_default_workers))),
@@ -138,7 +138,9 @@ class PrepareCoordinator:
             max_workers=self.ref_audio_workers,
             thread_name_prefix="prepare-ref-audio",
         )
-        text_cpu_gate_default = max(0, int(getattr(tts, "prepare_text_cpu_workers", 0) or 0))
+        # text CPU stage now relies on the worker's own pending queue for cross-request batching.
+        # Keeping this gate coupled to worker_count would cap queue formation and defeat batching.
+        text_cpu_gate_default = 0
         g2pw_gate_default = max(0, int(self.g2pw_workers))
         text_feature_gate_default = max(0, int(self.text_feature_workers))
         ref_audio_gate_default = max(0, int(self.ref_audio_workers))
@@ -257,7 +259,7 @@ class PrepareCoordinator:
             }
         wav16k, cpu_prepare_ms, limiter_stats = self.tts._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
         with self.tts.prepare_ref_audio_stage_limiter.enter() as stage_stats:
-            prompt_semantic, forward_ms = self.tts._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
+            prompt_semantic, runtime_profile = self.tts._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
         return {
             "prompt_semantic": prompt_semantic,
             "raw_audio": raw_audio,
@@ -277,11 +279,15 @@ class PrepareCoordinator:
                 "prompt_semantic_batch_dispatch_delay_ms": 0.0,
                 "prompt_semantic_cpu_prepare_ms": float(cpu_prepare_ms),
                 "prompt_semantic_pack_ms": 0.0,
-                "prompt_semantic_h2d_ms": 0.0,
-                "prompt_semantic_ssl_forward_ms": 0.0,
-                "prompt_semantic_hidden_length_ms": 0.0,
-                "prompt_semantic_extract_latent_ms": 0.0,
-                "prompt_semantic_forward_ms": float(forward_ms),
+                "prompt_semantic_h2d_ms": float(runtime_profile.get("prompt_semantic_h2d_ms", 0.0)),
+                "prompt_semantic_ssl_forward_ms": float(runtime_profile.get("prompt_semantic_ssl_forward_ms", 0.0)),
+                "prompt_semantic_hidden_length_ms": float(
+                    runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+                ),
+                "prompt_semantic_extract_latent_ms": float(
+                    runtime_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+                ),
+                "prompt_semantic_forward_ms": float(runtime_profile.get("prompt_semantic_forward_ms", 0.0)),
                 "prompt_semantic_scatter_ms": 0.0,
                 "prompt_semantic_stage_slots": float(stage_stats.get("slots", 0.0)),
                 "prompt_semantic_stage_inflight_peak": float(stage_stats.get("peak_inflight", 0.0)),
@@ -289,7 +295,9 @@ class PrepareCoordinator:
                 "prompt_semantic_batch_samples": 0.0,
                 "ref_spec_wait_ms": 0.0,
                 "ref_spec_ms": 0.0,
-                "bundle_total_ms": float(cpu_prepare_ms + forward_ms + stage_stats.get("wait_ms", 0.0)),
+                "bundle_total_ms": float(
+                    cpu_prepare_ms + runtime_profile.get("prompt_semantic_forward_ms", 0.0) + stage_stats.get("wait_ms", 0.0)
+                ),
             },
         }
 
@@ -339,6 +347,29 @@ class PrepareCoordinator:
         submit_at = time.perf_counter()
         return await loop.run_in_executor(executor, self._run_profiled, fn, float(submit_at), *args)
 
+    @staticmethod
+    def _build_text_cpu_profiled_result(
+        submit_at: float,
+        result: Any,
+        worker_profile: Dict[str, float],
+    ) -> ProfiledResult:
+        started_at = float(
+            submit_at
+            + (
+                float(worker_profile.get("text_cpu_admission_wait_ms", 0.0))
+                + float(worker_profile.get("text_cpu_queue_wait_ms", 0.0))
+            )
+            / 1000.0
+        )
+        finished_at = float(started_at + float(worker_profile.get("text_cpu_run_ms", 0.0)) / 1000.0)
+        return ProfiledResult(
+            result=result,
+            submit_at=float(submit_at),
+            started_at=started_at,
+            finished_at=finished_at,
+            profile=dict(worker_profile),
+        )
+
     async def _run_text_cpu_stage(self, text: str, language: str) -> ProfiledResult:
         await self.text_cpu_gate.acquire()
         if text in [None, ""]:
@@ -375,6 +406,53 @@ class PrepareCoordinator:
             return await self._run_on_executor(executor, self._prepare_text_cpu, text, language)
         finally:
             self.text_cpu_gate.release()
+
+    async def _run_text_cpu_stage_pair(
+        self,
+        prompt_text: str,
+        prompt_lang: str,
+        text: str,
+        text_lang: str,
+    ) -> tuple[ProfiledResult, ProfiledResult]:
+        text_cpu_worker = getattr(self.tts, "prepare_text_cpu_worker", None)
+        if (
+            text_cpu_worker is None
+            or not hasattr(text_cpu_worker, "submit_many_async")
+            or int(getattr(self.text_cpu_gate, "max_inflight", 0)) > 0
+        ):
+            prompt_cpu_task = asyncio.create_task(self._run_text_cpu_stage(prompt_text, prompt_lang))
+            target_cpu_task = asyncio.create_task(self._run_text_cpu_stage(text, text_lang))
+            return await asyncio.gather(prompt_cpu_task, target_cpu_task)
+
+        items = []
+        item_indices = []
+        profiled_results: list[ProfiledResult | None] = [None, None]
+        for index, (item_text, item_lang) in enumerate(((prompt_text, prompt_lang), (text, text_lang))):
+            if item_text in [None, ""]:
+                submit_at = time.perf_counter()
+                profiled_results[index] = ProfiledResult(
+                    result=[],
+                    submit_at=submit_at,
+                    started_at=submit_at,
+                    finished_at=submit_at,
+                )
+                continue
+            items.append((item_text, item_lang))
+            item_indices.append(index)
+
+        if items:
+            submit_at = time.perf_counter()
+            worker_results = await text_cpu_worker.submit_many_async(items)
+            for item_index, (result, worker_profile) in zip(item_indices, worker_results):
+                profiled_results[item_index] = self._build_text_cpu_profiled_result(
+                    submit_at,
+                    result,
+                    dict(worker_profile),
+                )
+
+        assert profiled_results[0] is not None
+        assert profiled_results[1] is not None
+        return profiled_results[0], profiled_results[1]
 
     async def _run_text_feature_stage(self, prepared_segments, language: str, cpu_run_ms: float) -> ProfiledResult:
         await self.text_feature_gate.acquire()
@@ -638,6 +716,18 @@ class PrepareCoordinator:
                     ),
                     "prompt_semantic_ms": float(prompt_semantic_ms),
                     "prompt_semantic_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
+                    "prompt_semantic_worker_queue_wait_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_batch_collect_wait_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_collect_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_stage_limiter_wait_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_stage_limiter_wait_ms", 0.0)
+                    ),
+                    "prompt_semantic_batch_dispatch_delay_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_dispatch_delay_ms", 0.0)
+                    ),
                     "prompt_semantic_cpu_prepare_ms": float(
                         prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
                     ),
@@ -661,6 +751,12 @@ class PrepareCoordinator:
                     "prompt_semantic_batch_size": float(prompt_semantic_profile.get("prompt_semantic_batch_size", 1.0)),
                     "prompt_semantic_batch_samples": float(
                         prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)
+                    ),
+                    "prompt_semantic_pool_workers": float(
+                        prompt_semantic_profile.get("prompt_semantic_pool_workers", 0.0)
+                    ),
+                    "prompt_semantic_shard_index": float(
+                        prompt_semantic_profile.get("prompt_semantic_shard_index", 0.0)
                     ),
                     "bundle_total_ms": float(
                         load_profiled.queue_ms
@@ -718,9 +814,12 @@ class PrepareCoordinator:
         prompt_text = normalize_sentence(spec.prompt_text, spec.prompt_lang)
         text = spec.text.strip("\n")
         try:
-            prompt_cpu_task = asyncio.create_task(self._run_text_cpu_stage(prompt_text, spec.prompt_lang))
-            target_cpu_task = asyncio.create_task(self._run_text_cpu_stage(text, spec.text_lang))
-            prompt_cpu_profiled, target_cpu_profiled = await asyncio.gather(prompt_cpu_task, target_cpu_task)
+            prompt_cpu_profiled, target_cpu_profiled = await self._run_text_cpu_stage_pair(
+                prompt_text,
+                spec.prompt_lang,
+                text,
+                spec.text_lang,
+            )
             return PreparedCpuStage(
                 spec=spec,
                 prepare_submit_at=float(prepare_submit_at),

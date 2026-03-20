@@ -1,7 +1,7 @@
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -13,9 +13,226 @@ from text.cleaner import clean_text
 
 
 PreparedTextSegmentPayload = Dict[str, object]
+PreparedTextSegmentBatchItem = Tuple[str, str, str, bool]
+_SegmentJob = Tuple[int, str, str, str]
+_MULTISPACE_PATTERN = re.compile(r" {2,}")
+_AUTO_ZH_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u4e00-\u9fff0-9\s、，。！？,.!?…：；\-—~～/·]+$")
+_AUTO_EN_FASTPATH_PATTERN = re.compile(
+    r"^(?=.*[A-Za-z])[A-Za-z0-9\s\u0020-\u007E\u2000-\u206F\u3000-\u303F\uFF00-\uFFEF]+$"
+)
+_AUTO_ZH_FASTPATH_LATIN_PATTERN = re.compile(r"[A-Za-z\uff21-\uff3a\uff41-\uff5a]")
+_AUTO_ZH_FASTPATH_JAKO_PATTERN = re.compile(r"[\u3040-\u30ff\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_AUTO_JA_FASTPATH_ALLOWED_PATTERN = re.compile(
+    r"^[\u3005\u3040-\u30ff\u4e00-\u9fff\uff11-\uff19\uff66-\uff9d0-9\s、，。！？,.!?…：；\-—~～/·]+$"
+)
+_AUTO_JA_DISTINCTIVE_PATTERN = re.compile(r"[\u3040-\u30ff\uff66-\uff9d]")
+_AUTO_KO_DISTINCTIVE_PATTERN = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_YUE_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u4e00-\u9fff0-9\s、，。！？,.!?…：；\-—~～/·]+$")
+_JA_FASTPATH_ALLOWED_PATTERN = re.compile(
+    r"^[\u3005\u3040-\u30ff\u4e00-\u9fff\uff11-\uff19\uff21-\uff3a\uff41-\uff5a\uff66-\uff9d0-9\s、，。！？,.!?…：；\-—~～/·]+$"
+)
+_KO_FASTPATH_ALLOWED_PATTERN = re.compile(r"^[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af0-9\s、，。！？,.!?…：；\-—~～/·]+$")
+_DIRECT_FASTPATH_LATIN_PATTERN = re.compile(r"[A-Za-z\uff21-\uff3a\uff41-\uff5a]")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _normalize_spaces(text: str) -> str:
+    return _MULTISPACE_PATTERN.sub(" ", str(text))
+
+
+def _is_direct_zh_fast_path(language: str) -> bool:
+    return _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_ZH_FASTPATH", True) and str(language) in {"zh", "all_zh"}
+
+
+def _get_direct_language_fast_path(language: str) -> str | None:
+    normalized = str(language)
+    if normalized in {"all_yue"} and _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_YUE_FASTPATH", True):
+        return "yue"
+    if normalized in {"all_ja"} and _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_JA_FASTPATH", True):
+        return "ja"
+    if normalized in {"all_ko"} and _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_KO_FASTPATH", True):
+        return "ko"
+    return None
+
+
+def _can_use_direct_language_fast_path(text: str, language: str) -> str | None:
+    target_language = _get_direct_language_fast_path(language)
+    if target_language is None or not text:
+        return None
+    if target_language == "yue":
+        if _YUE_FASTPATH_ALLOWED_PATTERN.fullmatch(text) and not _DIRECT_FASTPATH_LATIN_PATTERN.search(text):
+            return target_language
+        return None
+    if target_language == "ja":
+        if _JA_FASTPATH_ALLOWED_PATTERN.fullmatch(text) and not _DIRECT_FASTPATH_LATIN_PATTERN.search(text):
+            return target_language
+        return None
+    if target_language == "ko":
+        if _KO_FASTPATH_ALLOWED_PATTERN.fullmatch(text) and not _DIRECT_FASTPATH_LATIN_PATTERN.search(text):
+            return target_language
+        return None
+    return None
+
+
+def _is_auto_zh_fast_path(text: str, language: str) -> bool:
+    if str(language) not in {"auto", "auto_yue"}:
+        return False
+    if not _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_AUTO_ZH_FASTPATH", False):
+        return False
+    if not text or not _AUTO_ZH_FASTPATH_ALLOWED_PATTERN.fullmatch(text):
+        return False
+    if _AUTO_ZH_FASTPATH_LATIN_PATTERN.search(text) or _AUTO_ZH_FASTPATH_JAKO_PATTERN.search(text):
+        return False
+    cjk_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk_count > 0
+
+
+def _get_auto_single_language_fast_path(text: str, language: str) -> str | None:
+    normalized = str(language)
+    if normalized not in {"auto", "auto_yue"}:
+        return None
+    if not _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_AUTO_FASTPATH", True):
+        return None
+    if not text:
+        return None
+    if _AUTO_EN_FASTPATH_PATTERN.fullmatch(text):
+        return "en"
+    if _KO_FASTPATH_ALLOWED_PATTERN.fullmatch(text) and _AUTO_KO_DISTINCTIVE_PATTERN.search(text):
+        return "ko"
+    if _AUTO_JA_FASTPATH_ALLOWED_PATTERN.fullmatch(text) and _AUTO_JA_DISTINCTIVE_PATTERN.search(text):
+        return "ja"
+    if _AUTO_ZH_FASTPATH_ALLOWED_PATTERN.fullmatch(text):
+        if _AUTO_ZH_FASTPATH_LATIN_PATTERN.search(text) or _AUTO_ZH_FASTPATH_JAKO_PATTERN.search(text):
+            return None
+        cjk_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        if cjk_count > 0:
+            return "yue" if normalized == "auto_yue" else "zh"
+    return None
+
+
+def _should_use_zh_fast_path(text: str, language: str) -> bool:
+    return _is_direct_zh_fast_path(language) or _is_auto_zh_fast_path(text, language)
+
+
+def _build_zh_fast_path_payload(norm_text: str) -> List[PreparedTextSegmentPayload]:
+    return [
+        {
+            "language": "zh",
+            "phones": [],
+            "word2ph": None,
+            "norm_text": str(norm_text),
+            "needs_g2pw": True,
+        }
+    ]
+
+
+def _build_direct_language_payload(
+    text: str,
+    language: str,
+    version: str,
+) -> List[PreparedTextSegmentPayload]:
+    phones, word2ph, norm_text = clean_text_segment(text, language, version)
+    return [
+        {
+            "language": str(language).replace("all_", ""),
+            "phones": phones,
+            "word2ph": word2ph,
+            "norm_text": norm_text,
+            "needs_g2pw": False,
+        }
+    ]
+
+
+def _estimate_payload_phones_len(payloads: Sequence[PreparedTextSegmentPayload]) -> int:
+    total_phones_len = 0
+    for payload in payloads:
+        if bool(payload.get("needs_g2pw", False)):
+            total_phones_len += max(0, len(str(payload.get("norm_text", ""))) * 2)
+            continue
+        total_phones_len += len(payload.get("phones", []))
+    return int(total_phones_len)
+
+
+def _build_segment_payload(
+    *,
+    language: str,
+    phones: Sequence[int] | None,
+    word2ph: Sequence[int] | None,
+    norm_text: str,
+    needs_g2pw: bool,
+) -> PreparedTextSegmentPayload:
+    return {
+        "language": str(language),
+        "phones": [] if phones is None else list(phones),
+        "word2ph": None if word2ph is None else list(word2ph),
+        "norm_text": str(norm_text),
+        "needs_g2pw": bool(needs_g2pw),
+    }
+
+
+def _build_nonzh_segment_payloads_batch(
+    jobs: Sequence[_SegmentJob],
+) -> Dict[int, PreparedTextSegmentPayload]:
+    payloads_by_index: Dict[int, PreparedTextSegmentPayload] = {}
+    if not jobs:
+        return payloads_by_index
+    for segment_index, segment_text, segment_lang, version in jobs:
+        phones, word2ph, norm_text = clean_text_segment(segment_text, segment_lang, version)
+        payloads_by_index[segment_index] = _build_segment_payload(
+            language=segment_lang.replace("all_", ""),
+            phones=phones,
+            word2ph=word2ph,
+            norm_text=norm_text,
+            needs_g2pw=False,
+        )
+    return payloads_by_index
+
+
+def _build_zh_segment_payloads_batch(
+    jobs: Sequence[_SegmentJob],
+) -> Dict[int, PreparedTextSegmentPayload]:
+    payloads_by_index: Dict[int, PreparedTextSegmentPayload] = {}
+    if not jobs:
+        return payloads_by_index
+    norm_texts = chinese2.text_normalize_batch([segment_text for _, segment_text, _, _ in jobs])
+    for (segment_index, _segment_text, _segment_lang, _version), norm_text in zip(jobs, norm_texts):
+        payloads_by_index[segment_index] = _build_segment_payload(
+            language="zh",
+            phones=[],
+            word2ph=None,
+            norm_text=str(norm_text),
+            needs_g2pw=True,
+        )
+    return payloads_by_index
+
+
+def _build_segment_payloads_batch(
+    jobs_by_language: Dict[Tuple[str, str], List[_SegmentJob]],
+) -> Dict[int, PreparedTextSegmentPayload]:
+    payloads_by_index: Dict[int, PreparedTextSegmentPayload] = {}
+    for (normalized_language, _version), jobs in jobs_by_language.items():
+        if normalized_language == "zh":
+            payloads_by_index.update(_build_zh_segment_payloads_batch(jobs))
+            continue
+        payloads_by_index.update(_build_nonzh_segment_payloads_batch(jobs))
+    return payloads_by_index
 
 
 def split_text_by_language(text: str, language: str) -> Tuple[List[str], List[str]]:
+    if _should_use_zh_fast_path(text, language):
+        return [text], ["zh"]
+    auto_language = _get_auto_single_language_fast_path(text, language)
+    if auto_language is not None:
+        return [text], [auto_language]
+    direct_language = _can_use_direct_language_fast_path(text, language)
+    if direct_language is not None:
+        return [text], [direct_language]
     textlist: List[str] = []
     langlist: List[str] = []
     if language == "all_zh":
@@ -73,13 +290,37 @@ def clean_text_segment(text: str, language: str, version: str) -> Tuple[List[int
     return list(phones), None if word2ph is None else list(word2ph), str(norm_text)
 
 
-def preprocess_text_segments_payload(
+def _preprocess_text_segments_payload_impl(
     text: str,
     language: str,
     version: str,
     final: bool = False,
 ) -> List[PreparedTextSegmentPayload]:
-    text = re.sub(r" {2,}", " ", text)
+    text = _normalize_spaces(text)
+    if _should_use_zh_fast_path(text, language):
+        norm_text = chinese2.text_normalize(text)
+        if not final and max(0, len(norm_text) * 2) < 6:
+            return _preprocess_text_segments_payload_impl("." + text, language, version, final=True)
+        return _build_zh_fast_path_payload(norm_text)
+    auto_language = _get_auto_single_language_fast_path(text, language)
+    if auto_language is not None:
+        if auto_language == "zh":
+            norm_text = chinese2.text_normalize(text)
+            if not final and max(0, len(norm_text) * 2) < 6:
+                return _preprocess_text_segments_payload_impl("." + text, language, version, final=True)
+            return _build_zh_fast_path_payload(norm_text)
+        payloads = _build_direct_language_payload(text, auto_language, version)
+        estimated_phones_len = len(payloads[0]["phones"])
+        if not final and estimated_phones_len < 6:
+            return _preprocess_text_segments_payload_impl("." + text, language, version, final=True)
+        return payloads
+    direct_language = _can_use_direct_language_fast_path(text, language)
+    if direct_language is not None:
+        payloads = _build_direct_language_payload(text, direct_language, version)
+        estimated_phones_len = len(payloads[0]["phones"])
+        if not final and estimated_phones_len < 6:
+            return _preprocess_text_segments_payload_impl("." + text, language, version, final=True)
+        return payloads
     textlist, langlist = split_text_by_language(text, language)
     payloads: List[PreparedTextSegmentPayload] = []
     total_phones_len = 0
@@ -107,6 +348,73 @@ def preprocess_text_segments_payload(
         total_phones_len += int(estimated_phones_len)
 
     if not final and total_phones_len < 6:
-        return preprocess_text_segments_payload("." + text, language, version, final=True)
+        return _preprocess_text_segments_payload_impl("." + text, language, version, final=True)
 
     return payloads
+
+
+def preprocess_text_segments_payload(
+    text: str,
+    language: str,
+    version: str,
+    final: bool = False,
+) -> List[PreparedTextSegmentPayload]:
+    return _preprocess_text_segments_payload_impl(text, language, version, final=final)
+
+
+def preprocess_text_segments_payload_batch(
+    items: Sequence[PreparedTextSegmentBatchItem],
+) -> List[List[PreparedTextSegmentPayload]]:
+    normalized_items = [
+        (_normalize_spaces(str(text)), str(language), str(version), bool(final))
+        for text, language, version, final in items
+    ]
+    results: List[List[PreparedTextSegmentPayload] | None] = [None] * len(normalized_items)
+    item_segment_indices: List[List[int]] = [[] for _ in normalized_items]
+    jobs_by_language: Dict[Tuple[str, str], List[_SegmentJob]] = {}
+    retry_items: List[PreparedTextSegmentBatchItem] = []
+    retry_result_indices: List[int] = []
+    next_segment_index = 0
+
+    for index, (text, language, version, final) in enumerate(normalized_items):
+        segment_specs: List[Tuple[str, str]] = []
+        if _should_use_zh_fast_path(text, language):
+            segment_specs = [(text, "zh")]
+        else:
+            auto_language = _get_auto_single_language_fast_path(text, language)
+            if auto_language is not None:
+                segment_specs = [(text, auto_language)]
+            else:
+                direct_language = _can_use_direct_language_fast_path(text, language)
+                if direct_language is not None:
+                    segment_specs = [(text, direct_language)]
+                else:
+                    textlist, langlist = split_text_by_language(text, language)
+                    segment_specs = list(zip(textlist, langlist))
+
+        for segment_text, segment_lang in segment_specs:
+            segment_index = next_segment_index
+            next_segment_index += 1
+            item_segment_indices[index].append(segment_index)
+            normalized_language = str(segment_lang).replace("all_", "")
+            jobs_by_language.setdefault((normalized_language, version), []).append(
+                (segment_index, str(segment_text), str(segment_lang), version)
+            )
+
+    payloads_by_segment = _build_segment_payloads_batch(jobs_by_language)
+
+    for index, segment_indices in enumerate(item_segment_indices):
+        payloads = [payloads_by_segment[segment_index] for segment_index in segment_indices]
+        text, language, version, final = normalized_items[index]
+        if not final and _estimate_payload_phones_len(payloads) < 6:
+            retry_items.append(("." + text, language, version, True))
+            retry_result_indices.append(index)
+            continue
+        results[index] = payloads
+
+    if retry_items:
+        retry_results = preprocess_text_segments_payload_batch(retry_items)
+        for result_index, payloads in zip(retry_result_indices, retry_results):
+            results[result_index] = payloads
+
+    return [result if result is not None else [] for result in results]

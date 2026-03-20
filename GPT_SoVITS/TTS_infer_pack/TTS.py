@@ -38,9 +38,10 @@ from tools.audio_sr import AP_BWE
 from tools.i18n.i18n import I18nAuto, scan_language_list
 from TTS_infer_pack.text_segmentation_method import splits
 from TTS_infer_pack.TextPreprocessor import TextPreprocessor, StageLimiter
-from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker
+from TTS_infer_pack.prepare_bert_batch_worker import PrepareBertBatchWorker, PrepareBertBatchWorkerPool
 from TTS_infer_pack.prepare_ref_semantic_batch_worker import (
     PrepareRefSemanticBatchWorker,
+    PrepareRefSemanticBatchWorkerPool,
     prepare_prompt_semantic_wav16k,
 )
 from TTS_infer_pack.prepare_text_cpu_worker import PrepareTextCpuWorker
@@ -458,9 +459,12 @@ class TTS:
         self.prepare_bert_batch_worker = None
         self.prepare_ref_semantic_batch_worker = None
         self.prepare_text_cpu_worker = None
+        # Default on: request-local text CPU preprocessing blocks the event loop and serializes
+        # prepare_cpu_stage under high concurrency. Two workers still preserve large-batch formation
+        # while avoiding a single worker becoming the wall-clock bottleneck.
         self.prepare_text_cpu_workers = max(
             0,
-            int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_WORKERS", "0")),
+            int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_WORKERS", "2")),
         )
         self.prepare_text_cpu_executor = None
 
@@ -487,7 +491,7 @@ class TTS:
         self.prepare_ref_semantic_batch_worker = None
         self.prepare_text_cpu_worker = None
         if os.environ.get("GPTSOVITS_PREPARE_BERT_BATCHING", "1") != "0":
-            self.prepare_bert_batch_worker = PrepareBertBatchWorker(
+            bert_worker_kwargs = dict(
                 bert_model=self.bert_model,
                 tokenizer=self.bert_tokenizer,
                 device=self.configs.device,
@@ -510,11 +514,21 @@ class TTS:
                     os.environ.get("GPTSOVITS_PREPARE_BERT_HIGH_PRESSURE_MAX_TOKENS", "8192")
                 ),
             )
-        if os.environ.get("GPTSOVITS_PREPARE_REF_BATCHING", "0") != "0":
+            bert_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_BERT_BATCH_WORKERS", "2")))
+            if bert_batch_workers > 1:
+                self.prepare_bert_batch_worker = PrepareBertBatchWorkerPool(
+                    worker_count=int(bert_batch_workers),
+                    **bert_worker_kwargs,
+                )
+            else:
+                self.prepare_bert_batch_worker = PrepareBertBatchWorker(**bert_worker_kwargs)
+        # Default on: request-local prompt_semantic extraction causes large stage wait under high concurrency.
+        if os.environ.get("GPTSOVITS_PREPARE_REF_BATCHING", "1") != "0":
             ref_max_batch_samples = os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_SAMPLES")
             if ref_max_batch_samples is None:
                 ref_max_batch_samples = os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_FRAMES", "960000")
-            self.prepare_ref_semantic_batch_worker = PrepareRefSemanticBatchWorker(
+            ref_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_WORKERS", "2")))
+            self.prepare_ref_semantic_batch_worker = PrepareRefSemanticBatchWorkerPool(
                 ssl_model=self.cnhuhbert_model,
                 vits_model=self.vits_model,
                 device=self.configs.device,
@@ -524,6 +538,7 @@ class TTS:
                 batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_WINDOW_MS", "5")),
                 max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_MAX_ITEMS", "8")),
                 max_batch_samples=int(ref_max_batch_samples),
+                worker_count=int(ref_batch_workers),
             )
 
         self.text_preprocessor = TextPreprocessor(
@@ -541,7 +556,22 @@ class TTS:
                     language,
                     self.configs.version,
                 ),
+                batch_process_fn=lambda items: self.text_preprocessor.preprocess_text_segments_batch(
+                    list(items),
+                    self.configs.version,
+                ),
                 worker_count=self.prepare_text_cpu_workers,
+                batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_WINDOW_MS", "2")),
+                max_batch_items=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_BATCH_MAX_ITEMS", "32")),
+                high_pressure_pending_threshold=int(
+                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_PENDING_THRESHOLD", "0")
+                ),
+                high_pressure_batch_window_ms=int(
+                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_BATCH_WINDOW_MS", "4")
+                ),
+                high_pressure_max_batch_items=int(
+                    os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_HIGH_PRESSURE_MAX_ITEMS", "256")
+                ),
                 max_pending_tasks=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_MAX_PENDING_TASKS", "0")),
                 admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_ADMISSION_POLL_MS", "1")),
                 admission_controller=self._build_text_cpu_admission_state,
@@ -948,10 +978,29 @@ class TTS:
 
     @torch.inference_mode()
     def _extract_prompt_semantic_profile_from_prepared_wav16k(self, wav16k: torch.Tensor):
-        forward_start = time.perf_counter()
-        prompt_semantic = self._extract_prompt_semantic_from_prepared_wav16k(wav16k)
-        forward_ms = (time.perf_counter() - forward_start) * 1000.0
-        return prompt_semantic, forward_ms
+        h2d_start = time.perf_counter()
+        wav16k = wav16k.to(self.configs.device)
+        if self.configs.is_half:
+            wav16k = wav16k.half()
+        h2d_ms = (time.perf_counter() - h2d_start) * 1000.0
+
+        ssl_start = time.perf_counter()
+        hubert_feature = self.cnhuhbert_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
+        ssl_forward_ms = (time.perf_counter() - ssl_start) * 1000.0
+
+        latent_start = time.perf_counter()
+        codes = self.vits_model.extract_latent(hubert_feature)
+        extract_latent_ms = (time.perf_counter() - latent_start) * 1000.0
+        prompt_semantic = codes[0, 0].to(self.configs.device)
+
+        profile = {
+            "prompt_semantic_h2d_ms": float(h2d_ms),
+            "prompt_semantic_ssl_forward_ms": float(ssl_forward_ms),
+            "prompt_semantic_hidden_length_ms": 0.0,
+            "prompt_semantic_extract_latent_ms": float(extract_latent_ms),
+            "prompt_semantic_forward_ms": float(h2d_ms + ssl_forward_ms + extract_latent_ms),
+        }
+        return prompt_semantic, profile
 
     @torch.inference_mode()
     def _prepare_prompt_semantic_wav16k_profile(self, raw_audio: torch.Tensor, raw_sr: int):
@@ -983,8 +1032,8 @@ class TTS:
     @torch.inference_mode()
     def _extract_prompt_semantic_profile_from_raw(self, raw_audio: torch.Tensor, raw_sr: int):
         wav16k, cpu_prepare_ms, _ = self._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
-        prompt_semantic, forward_ms = self._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
-        return prompt_semantic, cpu_prepare_ms, forward_ms
+        prompt_semantic, profile = self._extract_prompt_semantic_profile_from_prepared_wav16k(wav16k)
+        return prompt_semantic, cpu_prepare_ms, dict(profile)
 
     @torch.inference_mode()
     def _extract_prompt_semantic_from_raw(self, raw_audio: torch.Tensor, raw_sr: int):
@@ -1058,13 +1107,14 @@ class TTS:
         load_start = time.perf_counter()
         raw_audio, raw_sr = self._load_ref_audio_raw(ref_audio_path)
         load_ms = (time.perf_counter() - load_start) * 1000.0
+        load_done_at = time.perf_counter()
         if self.prepare_ref_semantic_batch_worker is None:
             wav16k, prompt_semantic_cpu_prepare_ms, prompt_semantic_cpu_limiter_stats = (
                 self._prepare_prompt_semantic_wav16k_profile(raw_audio, raw_sr)
             )
             with self.prepare_ref_audio_stage_limiter.enter() as limiter_stats:
                 prompt_semantic_start = time.perf_counter()
-                prompt_semantic, prompt_semantic_forward_ms = self._extract_prompt_semantic_profile_from_prepared_wav16k(
+                prompt_semantic, prompt_semantic_runtime_profile = self._extract_prompt_semantic_profile_from_prepared_wav16k(
                     wav16k
                 )
                 prompt_semantic_ms = (time.perf_counter() - prompt_semantic_start) * 1000.0
@@ -1086,7 +1136,20 @@ class TTS:
                 "prompt_semantic_stage_limiter_wait_ms": float(limiter_stats["wait_ms"]),
                 "prompt_semantic_batch_dispatch_delay_ms": 0.0,
                 "prompt_semantic_cpu_prepare_ms": float(prompt_semantic_cpu_prepare_ms),
-                "prompt_semantic_forward_ms": float(prompt_semantic_forward_ms),
+                "prompt_semantic_pack_ms": 0.0,
+                "prompt_semantic_h2d_ms": float(prompt_semantic_runtime_profile.get("prompt_semantic_h2d_ms", 0.0)),
+                "prompt_semantic_ssl_forward_ms": float(
+                    prompt_semantic_runtime_profile.get("prompt_semantic_ssl_forward_ms", 0.0)
+                ),
+                "prompt_semantic_hidden_length_ms": float(
+                    prompt_semantic_runtime_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+                ),
+                "prompt_semantic_extract_latent_ms": float(
+                    prompt_semantic_runtime_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+                ),
+                "prompt_semantic_forward_ms": float(
+                    prompt_semantic_runtime_profile.get("prompt_semantic_forward_ms", prompt_semantic_ms)
+                ),
                 "prompt_semantic_scatter_ms": 0.0,
                 "prompt_semantic_stage_slots": float(limiter_stats["slots"]),
                 "prompt_semantic_stage_inflight_peak": float(limiter_stats["peak_inflight"]),
@@ -1130,6 +1193,17 @@ class TTS:
                     "prompt_semantic_cpu_prepare_ms": float(
                         prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0)
                     ),
+                    "prompt_semantic_pack_ms": float(prompt_semantic_profile.get("prompt_semantic_pack_ms", 0.0)),
+                    "prompt_semantic_h2d_ms": float(prompt_semantic_profile.get("prompt_semantic_h2d_ms", 0.0)),
+                    "prompt_semantic_ssl_forward_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_ssl_forward_ms", 0.0)
+                    ),
+                    "prompt_semantic_hidden_length_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_hidden_length_ms", 0.0)
+                    ),
+                    "prompt_semantic_extract_latent_ms": float(
+                        prompt_semantic_profile.get("prompt_semantic_extract_latent_ms", 0.0)
+                    ),
                     "prompt_semantic_forward_ms": float(
                         prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0)
                     ),
@@ -1170,8 +1244,15 @@ class TTS:
             "prompt_semantic_batch_samples": 0.0,
         }
         if self.prepare_ref_semantic_batch_worker is not None:
+            prompt_submit_at = time.perf_counter()
             prompt_semantic, worker_profile = self.prepare_ref_semantic_batch_worker.submit(raw_audio, raw_sr)
             prompt_semantic_profile.update(worker_profile)
+            prompt_semantic_profile["prompt_semantic_submit_offset_ms"] = float(
+                max(0.0, (prompt_submit_at - load_start) * 1000.0)
+            )
+            prompt_semantic_profile["prompt_semantic_submit_after_load_ms"] = float(
+                max(0.0, (prompt_submit_at - load_done_at) * 1000.0)
+            )
             prompt_semantic_ms = (
                 float(prompt_semantic_profile.get("prompt_semantic_cpu_prepare_ms", 0.0))
                 + float(prompt_semantic_profile.get("prompt_semantic_forward_ms", 0.0))
@@ -1204,6 +1285,12 @@ class TTS:
                 "audio_stage_inflight_peak": audio_stage_inflight_peak,
                 "prompt_semantic_ms": prompt_semantic_ms,
                 "prompt_semantic_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
+                "prompt_semantic_submit_offset_ms": float(
+                    prompt_semantic_profile.get("prompt_semantic_submit_offset_ms", 0.0)
+                ),
+                "prompt_semantic_submit_after_load_ms": float(
+                    prompt_semantic_profile.get("prompt_semantic_submit_after_load_ms", 0.0)
+                ),
                 "prompt_semantic_cpu_prepare_wait_ms": float(
                     prompt_semantic_profile.get("prompt_semantic_cpu_prepare_wait_ms", 0.0)
                 ),
@@ -1238,6 +1325,8 @@ class TTS:
                 "prompt_semantic_batch_samples": float(
                     prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)
                 ),
+                "prompt_semantic_pool_workers": float(prompt_semantic_profile.get("prompt_semantic_pool_workers", 0.0)),
+                "prompt_semantic_shard_index": float(prompt_semantic_profile.get("prompt_semantic_shard_index", 0.0)),
                 "ref_spec_wait_ms": float(ref_spec_limiter_stats["wait_ms"]),
                 "ref_spec_ms": ref_spec_ms,
                 "bundle_total_ms": load_ms + audio_stage_wait_ms + prompt_semantic_ms + ref_spec_ms,
@@ -1251,6 +1340,8 @@ class TTS:
         load_start = time.perf_counter()
         raw_audio, raw_sr = await asyncio.to_thread(self._load_ref_audio_raw, ref_audio_path)
         load_ms = (time.perf_counter() - load_start) * 1000.0
+        load_done_at = time.perf_counter()
+        prompt_submit_at = time.perf_counter()
 
         prompt_semantic_task = asyncio.create_task(
             self.prepare_ref_semantic_batch_worker.submit_async(raw_audio, raw_sr)
@@ -1302,6 +1393,10 @@ class TTS:
                 "audio_stage_inflight_peak": float(audio_stage_inflight_peak),
                 "prompt_semantic_ms": float(prompt_semantic_ms),
                 "prompt_semantic_wait_ms": float(prompt_semantic_profile.get("prompt_semantic_wait_ms", 0.0)),
+                "prompt_semantic_submit_offset_ms": float(max(0.0, (prompt_submit_at - load_start) * 1000.0)),
+                "prompt_semantic_submit_after_load_ms": float(
+                    max(0.0, (prompt_submit_at - load_done_at) * 1000.0)
+                ),
                 "prompt_semantic_worker_queue_wait_ms": float(
                     prompt_semantic_profile.get("prompt_semantic_worker_queue_wait_ms", 0.0)
                 ),
@@ -1323,6 +1418,8 @@ class TTS:
                 ),
                 "prompt_semantic_batch_size": float(prompt_semantic_profile.get("prompt_semantic_batch_size", 1.0)),
                 "prompt_semantic_batch_samples": float(prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)),
+                "prompt_semantic_pool_workers": float(prompt_semantic_profile.get("prompt_semantic_pool_workers", 0.0)),
+                "prompt_semantic_shard_index": float(prompt_semantic_profile.get("prompt_semantic_shard_index", 0.0)),
                 "ref_spec_wait_ms": float(ref_spec_profile.get("ref_spec_wait_ms", 0.0)),
                 "ref_spec_ms": float(ref_spec_profile.get("ref_spec_ms", 0.0)),
                 "bundle_total_ms": float(load_ms + audio_stage_wait_ms + prompt_semantic_ms + ref_spec_profile.get("ref_spec_ms", 0.0)),

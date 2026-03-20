@@ -4,6 +4,7 @@ import re
 from jamo import h2j, j2hcj
 import ko_pron
 from g2pk2 import G2p
+import g2pk2.g2pk2 as g2pk2_module
 
 import importlib
 import os
@@ -57,6 +58,106 @@ if os.name == "nt":
 
 
 from text.symbols2 import symbols
+
+_REGEX_CACHE_TARGET = 8192
+try:
+    if int(getattr(re, "_MAXCACHE", 0)) < _REGEX_CACHE_TARGET:
+        re._MAXCACHE = _REGEX_CACHE_TARGET
+except Exception:
+    pass
+
+_ASCII_ALPHA_PATTERN = re.compile(r"[A-Za-z]")
+_DIGIT_PATTERN = re.compile(r"\d")
+_ANNOTATION_MARK_PATTERN = re.compile(r"/[PJEB]")
+_TAIL_JAMO_PATTERN = re.compile(r"([\u3131-\u3163])$")
+_IDIOM_RULE_SEPARATOR = "==="
+_SPECIAL_G2PK2_FUNCS = (
+    g2pk2_module.jyeo,
+    g2pk2_module.ye,
+    g2pk2_module.consonant_ui,
+    g2pk2_module.josa_ui,
+    g2pk2_module.vowel_ui,
+    g2pk2_module.jamo,
+    g2pk2_module.rieulgiyeok,
+    g2pk2_module.rieulbieub,
+    g2pk2_module.verb_nieun,
+    g2pk2_module.balb,
+    g2pk2_module.palatalize,
+    g2pk2_module.modifying_rieul,
+)
+_LINK_G2PK2_FUNCS = (
+    g2pk2_module.link1,
+    g2pk2_module.link2,
+    g2pk2_module.link3,
+    g2pk2_module.link4,
+)
+
+
+def _load_compiled_idiom_rules(path: str) -> list[tuple[re.Pattern[str], str]]:
+    rules: list[tuple[re.Pattern[str], str]] = []
+    with open(path, "r", encoding="utf8") as idiom_file:
+        for raw_line in idiom_file:
+            line = raw_line.split("#")[0].strip()
+            if _IDIOM_RULE_SEPARATOR not in line:
+                continue
+            pattern_text, replacement = line.split(_IDIOM_RULE_SEPARATOR, 1)
+            rules.append((re.compile(pattern_text), replacement))
+    return rules
+
+
+class OptimizedG2p(G2p):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._idiom_rules = _load_compiled_idiom_rules(self.idioms_path)
+        self._compiled_table = [
+            (re.compile(pattern_text), replacement, tuple(rule_ids))
+            for pattern_text, replacement, rule_ids in self.table
+        ]
+
+    def idioms(self, string, descriptive=False, verbose=False):
+        rule = "from idioms.txt"
+        out = string
+        for pattern, replacement in self._idiom_rules:
+            out = pattern.sub(replacement, out)
+        g2pk2_module.gloss(verbose, out, string, rule)
+        return out
+
+    def __call__(self, string, descriptive=False, verbose=False, group_vowels=False, to_syl=True):
+        string = self.idioms(string, descriptive, verbose)
+
+        if _ASCII_ALPHA_PATTERN.search(string):
+            string = g2pk2_module.convert_eng(string, self.cmu)
+
+        string = g2pk2_module.annotate(string, self.mecab)
+
+        if _DIGIT_PATTERN.search(string):
+            string = g2pk2_module.convert_num(string)
+
+        inp = h2j(string)
+
+        for func in _SPECIAL_G2PK2_FUNCS:
+            inp = func(inp, descriptive, verbose)
+        inp = _ANNOTATION_MARK_PATTERN.sub("", inp)
+
+        for pattern, replacement, rule_ids in self._compiled_table:
+            previous = inp
+            inp = pattern.sub(replacement, inp)
+            if verbose:
+                if rule_ids:
+                    rule = "\n".join(self.rule2text.get(rule_id, "") for rule_id in rule_ids)
+                else:
+                    rule = ""
+                g2pk2_module.gloss(verbose, inp, previous, rule)
+
+        for func in _LINK_G2PK2_FUNCS:
+            inp = func(inp, descriptive, verbose)
+
+        if group_vowels:
+            inp = g2pk2_module.group(inp)
+
+        if to_syl:
+            inp = g2pk2_module.compose(inp)
+        return inp
 
 # This is a list of Korean classifiers preceded by pure Korean numerals.
 _korean_classifiers = (
@@ -286,7 +387,7 @@ def korean_to_lazy_ipa(text):
     return text
 
 
-_g2p = G2p()
+_g2p = OptimizedG2p()
 
 
 def korean_to_ipa(text):
@@ -326,7 +427,7 @@ def g2p(text):
     text = _g2p(text)
     text = divide_hangul(text)
     text = fix_g2pk2_error(text)
-    text = re.sub(r"([\u3131-\u3163])$", r"\1.", text)
+    text = _TAIL_JAMO_PATTERN.sub(r"\1.", text)
     # text = "".join([post_replace_ph(i) for i in text])
     text = [post_replace_ph(i) for i in text]
     return text
