@@ -92,6 +92,7 @@ _japanese_marks = re.compile(
 
 # List of (symbol, Japanese) pairs for marks:
 _symbols_to_japanese = [(re.compile("%s" % x[0]), x[1]) for x in [("％", "パーセント")]]
+_TRAILING_PASSTHROUGH_CHARS = frozenset(" \n：；，。！？·、,.!?")
 
 
 # List of (consonant, sokuon) pairs:
@@ -198,6 +199,24 @@ def preprocess_jap_batch(texts, with_prosody=False):
                 row.append(post_marks(marks[index].replace(" ", "")))
         rows.append(row)
     return rows
+
+
+def _suffix_to_phones(suffix_text):
+    if not suffix_text:
+        return ()
+    phones = []
+    for char in str(suffix_text):
+        if char == " ":
+            continue
+        phones.append(post_replace_ph(char.replace(" ", "")))
+    return tuple(phones)
+
+
+def _split_trailing_passthrough_suffix(text: str):
+    suffix_start = len(text)
+    while suffix_start > 0 and text[suffix_start - 1] in _TRAILING_PASSTHROUGH_CHARS:
+        suffix_start -= 1
+    return text[:suffix_start], text[suffix_start:]
 
 
 def text_normalize(text):
@@ -313,8 +332,34 @@ def g2p_batch(norm_texts, with_prosody=True):
         return []
     if len(normalized_texts) == 1:
         return [list(_g2p_cached(normalized_texts[0], bool(with_prosody)))]
-    rows = preprocess_jap_batch(normalized_texts, with_prosody=with_prosody)
-    return [[post_replace_ph(phone) for phone in row] for row in rows]
+    rows = [None] * len(normalized_texts)
+    unique_core_texts = []
+    core_to_pos = {}
+    use_prosody = bool(with_prosody)
+    pending_indices = []
+
+    for index, text in enumerate(normalized_texts):
+        core_text, suffix_text = _split_trailing_passthrough_suffix(text)
+        if not core_text:
+            rows[index] = list(_suffix_to_phones(suffix_text))
+            continue
+        core_pos = core_to_pos.get(core_text)
+        if core_pos is None:
+            core_pos = len(unique_core_texts)
+            core_to_pos[core_text] = core_pos
+            unique_core_texts.append(core_text)
+        pending_indices.append(index)
+
+    core_rows = []
+    if unique_core_texts:
+        core_rows = [
+            tuple(post_replace_ph(phone) for phone in row)
+            for row in preprocess_jap_batch(unique_core_texts, with_prosody=use_prosody)
+        ]
+    for index in pending_indices:
+        core_text, suffix_text = _split_trailing_passthrough_suffix(normalized_texts[index])
+        rows[index] = list(core_rows[core_to_pos[core_text]] + _suffix_to_phones(suffix_text))
+    return [row if row is not None else [] for row in rows]
 
 
 if __name__ == "__main__":

@@ -35,6 +35,8 @@ rep_map = {
 }
 
 _TEXT_NORMALIZE_PATTERN = re.compile("|".join(re.escape(p) for p in rep_map.keys()))
+_TRAILING_PASSTHROUGH_CHARS = frozenset(" \n：；，。！？·、,.!?")
+_SIMPLE_WORD_PATTERN = re.compile(r"^[A-Za-z]+(?:'[A-Za-z]+)?$")
 
 
 arpa = {
@@ -374,9 +376,36 @@ def _postprocess_phone_list(phone_list):
     return tuple(replace_phs(phones))
 
 
+def _suffix_to_phones(suffix_text: str):
+    if not suffix_text:
+        return ()
+    phones = []
+    for char in str(suffix_text):
+        if char == " ":
+            continue
+        phones.extend(replace_phs([char]))
+    return tuple(phones)
+
+
 @lru_cache(maxsize=8192)
 def _g2p_cached(text: str):
     return _postprocess_phone_list(_g2p(str(text)))
+
+
+def _split_trailing_passthrough_suffix(text: str):
+    suffix_start = len(text)
+    while suffix_start > 0 and text[suffix_start - 1] in _TRAILING_PASSTHROUGH_CHARS:
+        suffix_start -= 1
+    return text[:suffix_start], text[suffix_start:]
+
+
+def _is_simple_word_core(text: str):
+    return bool(_SIMPLE_WORD_PATTERN.fullmatch(str(text)))
+
+
+@lru_cache(maxsize=8192)
+def _g2p_simple_word_cached(text: str):
+    return _postprocess_phone_list(_g2p.qryword(str(text)))
 
 
 def g2p(text):
@@ -389,7 +418,51 @@ def g2p_batch(texts):
         return []
     if len(normalized_texts) == 1:
         return [list(_g2p_cached(normalized_texts[0]))]
-    return [list(_postprocess_phone_list(phone_list)) for phone_list in _g2p.batch(normalized_texts)]
+    rows = [None] * len(normalized_texts)
+    hard_indices = []
+    hard_core_texts = []
+    hard_cached_rows = {}
+
+    for index, text in enumerate(normalized_texts):
+        core_text, suffix_text = _split_trailing_passthrough_suffix(text)
+        suffix_phones = _suffix_to_phones(suffix_text)
+        if not core_text:
+            rows[index] = list(suffix_phones)
+            continue
+        if _is_simple_word_core(core_text) and core_text.lower() not in _g2p.homograph2features:
+            rows[index] = list(_g2p_simple_word_cached(core_text) + suffix_phones)
+            continue
+        cached_core = hard_cached_rows.get(core_text)
+        if cached_core is None:
+            hard_cached_rows[core_text] = ()
+            hard_indices.append(index)
+            hard_core_texts.append(core_text)
+            continue
+        if cached_core:
+            rows[index] = list(cached_core + suffix_phones)
+            continue
+        hard_indices.append(index)
+        hard_core_texts.append(core_text)
+
+    if hard_core_texts:
+        unique_hard_cores = []
+        unique_core_to_pos = {}
+        hard_index_to_unique_pos = []
+        for core_text in hard_core_texts:
+            unique_pos = unique_core_to_pos.get(core_text)
+            if unique_pos is None:
+                unique_pos = len(unique_hard_cores)
+                unique_core_to_pos[core_text] = unique_pos
+                unique_hard_cores.append(core_text)
+            hard_index_to_unique_pos.append(unique_pos)
+        hard_phone_rows = [_postprocess_phone_list(phone_list) for phone_list in _g2p.batch(unique_hard_cores)]
+        for core_text, unique_pos in unique_core_to_pos.items():
+            hard_cached_rows[core_text] = hard_phone_rows[unique_pos]
+        for index, unique_pos in zip(hard_indices, hard_index_to_unique_pos):
+            core_text, suffix_text = _split_trailing_passthrough_suffix(normalized_texts[index])
+            rows[index] = list(hard_phone_rows[unique_pos] + _suffix_to_phones(suffix_text))
+
+    return [row if row is not None else [] for row in rows]
 
 
 if __name__ == "__main__":

@@ -10,6 +10,9 @@ import os
 from text import symbols as symbols_v1
 from text import symbols2 as symbols_v2
 
+_SYMBOLS_SET_V1 = frozenset(symbols_v1.symbols)
+_SYMBOLS_SET_V2 = frozenset(symbols_v2.symbols)
+
 special = [
     # ("%", "zh", "SP"),
     ("￥", "zh", "SP2"),
@@ -23,9 +26,11 @@ def clean_text(text, language, version=None):
         version = os.environ.get("version", "v2")
     if version == "v1":
         symbols = symbols_v1.symbols
+        symbols_set = _SYMBOLS_SET_V1
         language_module_map = {"zh": "chinese", "ja": "japanese", "en": "english"}
     else:
         symbols = symbols_v2.symbols
+        symbols_set = _SYMBOLS_SET_V2
         language_module_map = {"zh": "chinese2", "ja": "japanese", "en": "english", "ko": "korean", "yue": "cantonese"}
 
     if language not in language_module_map:
@@ -51,7 +56,7 @@ def clean_text(text, language, version=None):
     else:
         phones = language_module.g2p(norm_text)
         word2ph = None
-    phones = ["UNK" if ph not in symbols else ph for ph in phones]
+    phones = ["UNK" if ph not in symbols_set else ph for ph in phones]
     return phones, word2ph, norm_text
 
 
@@ -59,10 +64,10 @@ def clean_text_batch(texts, language, version=None):
     if version is None:
         version = os.environ.get("version", "v2")
     if version == "v1":
-        symbols = symbols_v1.symbols
+        symbols_set = _SYMBOLS_SET_V1
         language_module_map = {"zh": "chinese", "ja": "japanese", "en": "english"}
     else:
-        symbols = symbols_v2.symbols
+        symbols_set = _SYMBOLS_SET_V2
         language_module_map = {"zh": "chinese2", "ja": "japanese", "en": "english", "ko": "korean", "yue": "cantonese"}
 
     normalized_language = str(language)
@@ -110,7 +115,7 @@ def clean_text_batch(texts, language, version=None):
     phone_rows = [unique_phone_rows[index] for index in norm_text_indices]
 
     for phones, norm_text in zip(phone_rows, norm_texts):
-        mapped_phones = ["UNK" if ph not in symbols else ph for ph in phones]
+        mapped_phones = ["UNK" if ph not in symbols_set else ph for ph in phones]
         word2ph = None
         if normalized_language == "en" and len(mapped_phones) < 4:
             mapped_phones = [","] + mapped_phones
@@ -122,10 +127,10 @@ def clean_special(text, language, special_s, target_symbol, version=None):
     if version is None:
         version = os.environ.get("version", "v2")
     if version == "v1":
-        symbols = symbols_v1.symbols
+        symbols_set = _SYMBOLS_SET_V1
         language_module_map = {"zh": "chinese", "ja": "japanese", "en": "english"}
     else:
-        symbols = symbols_v2.symbols
+        symbols_set = _SYMBOLS_SET_V2
         language_module_map = {"zh": "chinese2", "ja": "japanese", "en": "english", "ko": "korean", "yue": "cantonese"}
 
     """
@@ -137,7 +142,7 @@ def clean_special(text, language, special_s, target_symbol, version=None):
     phones = language_module.g2p(norm_text)
     new_ph = []
     for ph in phones[0]:
-        assert ph in symbols
+        assert ph in symbols_set
         if ph == ",":
             new_ph.append(target_symbol)
         else:
