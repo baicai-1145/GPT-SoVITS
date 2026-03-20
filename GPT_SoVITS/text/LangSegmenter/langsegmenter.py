@@ -214,11 +214,122 @@ class LangSegmenter():
     @classmethod
     def getTextsBatch(cls, texts, default_lang = ""):
         splitter = cls._get_splitter(default_lang)
-        return [cls._getTexts_with_splitter(text, splitter, default_lang) for text in texts]
+        rows = splitter.split_by_lang_batch([str(text) for text in texts])
+        return [cls._build_lang_list_from_splitter_rows(substr, default_lang) for substr in rows]
 
     def getTexts(text,default_lang = ""):
         splitter = LangSegmenter._get_splitter(default_lang)
         return LangSegmenter._getTexts_with_splitter(text, splitter, default_lang)
+
+    @classmethod
+    def _build_lang_list_from_splitter_rows(cls, substr, default_lang: str = ""):
+        lang_list: list[dict] = []
+        have_num = False
+
+        for _, item in enumerate(substr):
+            dict_item = {'lang':item.lang,'text':item.text}
+
+            if dict_item['lang'] == 'digit':
+                if default_lang != "":
+                    dict_item['lang'] = default_lang
+                else:
+                    have_num = True
+                lang_list = merge_lang(lang_list,dict_item)
+                continue
+
+            if full_en(dict_item['text']):
+                dict_item['lang'] = 'en'
+                lang_list = merge_lang(lang_list,dict_item)
+                continue
+
+            if default_lang != "":
+                dict_item['lang'] = default_lang
+                lang_list = merge_lang(lang_list,dict_item)
+                continue
+
+            ja_list: list[dict] = []
+            if dict_item['lang'] != 'ja':
+                ja_list = split_jako('ja',dict_item)
+
+            if not ja_list:
+                ja_list.append(dict_item)
+
+            ko_list: list[dict] = []
+            temp_list: list[dict] = []
+            for _, ko_item in enumerate(ja_list):
+                if ko_item["lang"] != 'ko':
+                    ko_list = split_jako('ko',ko_item)
+
+                if ko_list:
+                    temp_list.extend(ko_list)
+                else:
+                    temp_list.append(ko_item)
+
+            if len(temp_list) == 1:
+                if dict_item['lang'] == 'x':
+                    cjk_text = full_cjk(dict_item['text'])
+                    if cjk_text:
+                        dict_item = {'lang':'zh','text':cjk_text}
+                        lang_list = merge_lang(lang_list,dict_item)
+                    else:
+                        lang_list = merge_lang(lang_list,dict_item)
+                    continue
+                lang_list = merge_lang(lang_list,dict_item)
+                continue
+
+            for _, temp_item in enumerate(temp_list):
+                if temp_item['lang'] == 'x':
+                    cjk_text = full_cjk(temp_item['text'])
+                    if cjk_text:
+                        lang_list = merge_lang(lang_list,{'lang':'zh','text':cjk_text})
+                    else:
+                        lang_list = merge_lang(lang_list,temp_item)
+                else:
+                    lang_list = merge_lang(lang_list,temp_item)
+
+        if have_num:
+            temp_list = lang_list
+            lang_list = []
+            for i, temp_item in enumerate(temp_list):
+                if temp_item['lang'] == 'digit':
+                    if default_lang:
+                        temp_item['lang'] = default_lang
+                    elif lang_list and i == len(temp_list) - 1:
+                        temp_item['lang'] = lang_list[-1]['lang']
+                    elif not lang_list and i < len(temp_list) - 1:
+                        temp_item['lang'] = temp_list[1]['lang']
+                    elif lang_list and i < len(temp_list) - 1:
+                        if lang_list[-1]['lang'] == temp_list[i + 1]['lang']:
+                            temp_item['lang'] = lang_list[-1]['lang']
+                        elif lang_list[-1]['text'][-1] in [",",".","!","?","，","。","！","？"]:
+                            temp_item['lang'] = temp_list[i + 1]['lang']
+                        elif temp_list[i + 1]['text'][0] in [",",".","!","?","，","。","！","？"]:
+                            temp_item['lang'] = lang_list[-1]['lang']
+                        elif temp_item['text'][-1] in ["。","."]:
+                            temp_item['lang'] = lang_list[-1]['lang']
+                        elif len(lang_list[-1]['text']) >= len(temp_list[i + 1]['text']):
+                            temp_item['lang'] = lang_list[-1]['lang']
+                        else:
+                            temp_item['lang'] = temp_list[i + 1]['lang']
+                    else:
+                        temp_item['lang'] = 'zh'
+
+                lang_list = merge_lang(lang_list,temp_item)
+
+        temp_list = lang_list
+        lang_list = []
+        for _, temp_item in enumerate(temp_list):
+            if temp_item['lang'] == 'x':
+                if lang_list:
+                    temp_item['lang'] = lang_list[-1]['lang']
+                elif len(temp_list) > 1:
+                    temp_item['lang'] = temp_list[1]['lang']
+                else:
+                    temp_item['lang'] = 'zh'
+
+            lang_list = merge_lang(lang_list,temp_item)
+
+        return lang_list
     
 
 if __name__ == "__main__":

@@ -41,26 +41,43 @@ class PrepareTextCpuWorker:
         max_pending_tasks: int = 0,
         admission_poll_ms: int = 1,
         admission_controller: Callable[[], Dict[str, float | int | bool]] | None = None,
+        large_batch_priority: bool = True,
+        min_batch_window_ms: int = 2,
+        min_high_pressure_batch_window_ms: int | None = None,
     ) -> None:
         if process_fn is None and batch_process_fn is None:
             raise ValueError("PrepareTextCpuWorker 需要 process_fn 或 batch_process_fn")
         self.process_fn = process_fn
         self.batch_process_fn = batch_process_fn
         self.worker_count = max(1, int(worker_count))
-        self.batch_window_ms = max(0, int(batch_window_ms))
-        self.batch_window_s = float(self.batch_window_ms) / 1000.0
         self.max_batch_items = max(1, int(max_batch_items))
+        self.large_batch_priority = bool(large_batch_priority)
+        self.min_batch_window_ms = max(0, int(min_batch_window_ms))
+        hp_min_window_ms = self.min_batch_window_ms if min_high_pressure_batch_window_ms is None else int(
+            min_high_pressure_batch_window_ms
+        )
+        self.min_high_pressure_batch_window_ms = max(0, hp_min_window_ms)
+        self.batch_window_ms = self._resolve_effective_batch_window_ms(
+            int(batch_window_ms),
+            self.max_batch_items,
+            self.min_batch_window_ms,
+        )
+        self.batch_window_s = float(self.batch_window_ms) / 1000.0
         self.high_pressure_pending_threshold = max(
             0,
             int(high_pressure_pending_threshold)
             if int(high_pressure_pending_threshold) > 0
             else max(self.max_batch_items * 2, 64),
         )
-        hp_window_ms = self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
         hp_items = self.max_batch_items if high_pressure_max_batch_items is None else int(high_pressure_max_batch_items)
-        self.high_pressure_batch_window_ms = max(0, hp_window_ms)
-        self.high_pressure_batch_window_s = float(self.high_pressure_batch_window_ms) / 1000.0
+        hp_window_ms = self.batch_window_ms if high_pressure_batch_window_ms is None else int(high_pressure_batch_window_ms)
         self.high_pressure_max_batch_items = max(self.max_batch_items, hp_items)
+        self.high_pressure_batch_window_ms = self._resolve_effective_batch_window_ms(
+            hp_window_ms,
+            self.high_pressure_max_batch_items,
+            self.min_high_pressure_batch_window_ms,
+        )
+        self.high_pressure_batch_window_s = float(self.high_pressure_batch_window_ms) / 1000.0
         self.max_pending_tasks = max(0, int(max_pending_tasks))
         self.admission_poll_s = max(0.0005, float(max(1, int(admission_poll_ms))) / 1000.0)
         self.admission_controller = admission_controller
@@ -91,6 +108,17 @@ class PrepareTextCpuWorker:
         ]
         for thread in self.worker_threads:
             thread.start()
+
+    def _resolve_effective_batch_window_ms(
+        self,
+        batch_window_ms: int,
+        max_batch_items: int,
+        min_batch_window_ms: int,
+    ) -> int:
+        effective_window_ms = max(0, int(batch_window_ms))
+        if not self.large_batch_priority or int(max_batch_items) <= 1:
+            return effective_window_ms
+        return max(effective_window_ms, max(0, int(min_batch_window_ms)))
 
     def _can_enqueue_locked(self, task_count: int = 1) -> bool:
         if self.max_pending_tasks <= 0:
@@ -237,6 +265,9 @@ class PrepareTextCpuWorker:
                 "high_pressure_pending_threshold": int(self.high_pressure_pending_threshold),
                 "high_pressure_batch_window_ms": int(self.high_pressure_batch_window_ms),
                 "high_pressure_max_batch_items": int(self.high_pressure_max_batch_items),
+                "large_batch_priority": bool(self.large_batch_priority),
+                "min_batch_window_ms": int(self.min_batch_window_ms),
+                "min_high_pressure_batch_window_ms": int(self.min_high_pressure_batch_window_ms),
                 "high_pressure_batches": int(self.high_pressure_batches),
                 "max_pending_tasks": int(self.max_pending_tasks),
                 "admission_wait_total_ms": float(self.admission_wait_total_ms),
@@ -270,6 +301,12 @@ class PrepareTextCpuWorker:
             deadline = time.perf_counter() + batch_window_s
 
             while len(batch) < max_batch_items:
+                while self.pending_tasks and len(batch) < max_batch_items:
+                    next_task = self.pending_tasks.popleft()
+                    next_task.batch_popped_at = time.perf_counter()
+                    batch.append(next_task)
+                if len(batch) >= max_batch_items:
+                    break
                 next_batch_window_s, next_max_batch_items, next_use_high_pressure = self._select_batch_policy_locked()
                 if next_use_high_pressure:
                     if not use_high_pressure:

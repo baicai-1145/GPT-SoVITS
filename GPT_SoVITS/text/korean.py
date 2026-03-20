@@ -72,6 +72,7 @@ _DIGIT_PATTERN = re.compile(r"\d")
 _ANNOTATION_MARK_PATTERN = re.compile(r"/[PJEB]")
 _TAIL_JAMO_PATTERN = re.compile(r"([\u3131-\u3163])$")
 _IDIOM_RULE_SEPARATOR = "==="
+_TRAILING_PASSTHROUGH_CHARS = frozenset(" \n：；，。！？·、,.!?")
 _SPECIAL_G2PK2_FUNCS = (
     g2pk2_module.jyeo,
     g2pk2_module.ye,
@@ -228,6 +229,26 @@ _latin_to_hangul = [
         ("z", "제트"),
     ]
 ]
+_latin_char_to_hangul = {}
+for _regex, _replacement in _latin_to_hangul:
+    _pattern_text = str(_regex.pattern)
+    if len(_pattern_text) == 1 and _pattern_text.isalpha():
+        _latin_char_to_hangul[_pattern_text.lower()] = _replacement
+_hangul_divided_map = {
+    "ㅘ": "ㅗㅏ",
+    "ㅙ": "ㅗㅐ",
+    "ㅚ": "ㅗㅣ",
+    "ㅝ": "ㅜㅓ",
+    "ㅞ": "ㅜㅔ",
+    "ㅟ": "ㅜㅣ",
+    "ㅢ": "ㅡㅣ",
+    "ㅑ": "ㅣㅏ",
+    "ㅒ": "ㅣㅐ",
+    "ㅕ": "ㅣㅓ",
+    "ㅖ": "ㅣㅔ",
+    "ㅛ": "ㅣㅗ",
+    "ㅠ": "ㅣㅜ",
+}
 
 # List of (ipa, lazy ipa) pairs:
 _ipa_to_lazy_ipa = [
@@ -255,6 +276,8 @@ _ipa_to_lazy_ipa = [
 
 
 def fix_g2pk2_error(text):
+    if "ㅇㅡㄹ " not in text and "ㄹㅡㄹ " not in text:
+        return text
     new_text = ""
     i = 0
     while i < len(text) - 4:
@@ -270,16 +293,21 @@ def fix_g2pk2_error(text):
 
 
 def latin_to_hangul(text):
-    for regex, replacement in _latin_to_hangul:
-        text = re.sub(regex, replacement, text)
-    return text
+    if not _ASCII_ALPHA_PATTERN.search(text):
+        return text
+    converted = []
+    append = converted.append
+    for char in str(text):
+        replacement = _latin_char_to_hangul.get(char.lower()) if char.isascii() and char.isalpha() else None
+        append(replacement if replacement is not None else char)
+    return "".join(converted)
 
 
 def divide_hangul(text):
     text = j2hcj(h2j(text))
-    for regex, replacement in _hangul_divided:
-        text = re.sub(regex, replacement, text)
-    return text
+    if not any(char in _hangul_divided_map for char in text):
+        return text
+    return "".join(_hangul_divided_map.get(char, char) for char in text)
 
 
 def hangul_number(num, sino=True):
@@ -424,37 +452,44 @@ def post_replace_ph(ph):
 
 
 def g2p(text):
-    text = latin_to_hangul(text)
-    text = _g2p(text)
-    text = divide_hangul(text)
-    text = fix_g2pk2_error(text)
-    text = _TAIL_JAMO_PATTERN.sub(r"\1.", text)
-    # text = "".join([post_replace_ph(i) for i in text])
-    text = [post_replace_ph(i) for i in text]
-    return text
+    return _finalize_g2p_row(str(text))
 
 
 @lru_cache(maxsize=8192)
 def _g2p_cached(text: str):
-    return tuple(g2p(str(text)))
+    return tuple(_finalize_g2p_row(str(text)))
+
+def _split_trailing_passthrough_suffix(text: str) -> tuple[str, str]:
+    suffix_start = len(text)
+    while suffix_start > 0 and text[suffix_start - 1] in _TRAILING_PASSTHROUGH_CHARS:
+        suffix_start -= 1
+    return text[:suffix_start], text[suffix_start:]
 
 
-def _g2p_batch_uncached(texts):
-    to_hangul = latin_to_hangul
-    convert = _g2p
-    divide = divide_hangul
-    fix = fix_g2pk2_error
-    tail_pattern = _TAIL_JAMO_PATTERN
-    replace_phone = post_replace_ph
-    rows = []
-    for text in texts:
-        value = to_hangul(str(text))
-        value = convert(value)
-        value = divide(value)
-        value = fix(value)
-        value = tail_pattern.sub(r"\1.", value)
-        rows.append([replace_phone(char) for char in value])
-    return rows
+@lru_cache(maxsize=8192)
+def _transform_core_to_jamo_text(core_text: str) -> str:
+    value = latin_to_hangul(str(core_text))
+    value = _g2p(value)
+    value = divide_hangul(value)
+    value = fix_g2pk2_error(value)
+    return value
+
+
+def _finalize_core_and_suffix(core_text: str, suffix_text: str) -> list[str]:
+    if not core_text:
+        return [post_replace_ph(char) for char in suffix_text]
+    value = _transform_core_to_jamo_text(core_text)
+    if not suffix_text:
+        value = _TAIL_JAMO_PATTERN.sub(r"\1.", value)
+    row = [post_replace_ph(char) for char in value]
+    if suffix_text:
+        row.extend(post_replace_ph(char) for char in suffix_text)
+    return row
+
+
+def _finalize_g2p_row(text: str) -> list[str]:
+    core_text, suffix_text = _split_trailing_passthrough_suffix(str(text))
+    return _finalize_core_and_suffix(core_text, suffix_text)
 
 
 def g2p_batch(texts):
@@ -463,7 +498,36 @@ def g2p_batch(texts):
         return []
     if len(normalized_texts) == 1:
         return [list(_g2p_cached(normalized_texts[0]))]
-    return _g2p_batch_uncached(normalized_texts)
+    rows: list[list[str] | None] = [None] * len(normalized_texts)
+    core_indices: list[int | None] = [None] * len(normalized_texts)
+    unique_core_order: list[str] = []
+    core_index_by_text: dict[str, int] = {}
+    text_parts: list[tuple[int, str]] = []
+
+    for index, text in enumerate(normalized_texts):
+        core_text, suffix_text = _split_trailing_passthrough_suffix(text)
+        if not core_text:
+            rows[index] = [post_replace_ph(char) for char in suffix_text]
+            continue
+        core_index = core_index_by_text.get(core_text)
+        if core_index is None:
+            core_index = len(unique_core_order)
+            core_index_by_text[core_text] = core_index
+            unique_core_order.append(core_text)
+        core_indices[index] = core_index
+        text_parts.append((index, suffix_text))
+
+    core_rows = [_transform_core_to_jamo_text(core_text) for core_text in unique_core_order]
+    for index, suffix_text in text_parts:
+        core_index = int(core_indices[index])
+        value = core_rows[core_index]
+        if not suffix_text:
+            value = _TAIL_JAMO_PATTERN.sub(r"\1.", value)
+        row = [post_replace_ph(char) for char in value]
+        if suffix_text:
+            row.extend(post_replace_ph(char) for char in suffix_text)
+        rows[index] = row
+    return [row if row is not None else [] for row in rows]
 
 
 if __name__ == "__main__":
