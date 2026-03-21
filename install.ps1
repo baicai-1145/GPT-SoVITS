@@ -225,6 +225,8 @@ Write-Success "PyTorch Installed"
 Write-Info "Installing Python Dependencies From requirements.txt..."
 Invoke-Pip -r extra-req.txt --no-deps
 Invoke-Pip -r requirements.txt
+Write-Info "Installing Bundled split-lang From third_party/split-lang..."
+Invoke-Pip .\third_party\split-lang
 Write-Success "Python Dependencies Installed"
 
 Write-Info "Downloading NLTK Data..."

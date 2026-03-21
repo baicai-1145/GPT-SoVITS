@@ -9,6 +9,7 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from text.LangSegmenter import LangSegmenter
+from text.split_fastpath_native import scan_selective_direct_runs as scan_selective_direct_runs_native
 from text import cleaned_text_to_sequence
 from text import chinese2
 from text.cleaner import clean_text, clean_text_batch
@@ -39,6 +40,8 @@ _WHITESPACE_TOKEN_PATTERN = re.compile(r"\S+\s*")
 _TOKEN_STRIP_PUNCT_PATTERN = re.compile(r"^[、，。！？,.!?…：；\-—~～/·]+|[、，。！？,.!?…：；\-—~～/·]+$")
 _TOKEN_HAS_CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 _TRIVIAL_BRIDGE_PATTERN = re.compile(r"^[0-9\s、，。！？,.!?…：；\-—~～/·]*$")
+_ASCII_TRIVIAL_BRIDGE_CHARS = frozenset(",.!?-/~")
+_UNICODE_TRIVIAL_BRIDGE_CHARS = frozenset("、，。！？…：；—～/·")
 _PAYLOAD_CACHE_LOCK = threading.Lock()
 _PAYLOAD_CACHE: "OrderedDict[PreparedTextSegmentBatchItem, List[PreparedTextSegmentPayload]]" = OrderedDict()
 
@@ -52,6 +55,10 @@ def _env_flag(name: str, default: bool) -> bool:
 
 _PAYLOAD_CACHE_MAX_ITEMS = max(0, int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_CACHE_MAX_ITEMS", "4096")))
 _PAYLOAD_CACHE_ENABLED = _PAYLOAD_CACHE_MAX_ITEMS > 0 and _env_flag("GPTSOVITS_PREPARE_TEXT_CPU_CACHE", True)
+_NATIVE_SPAN_AMBIGUOUS = 0
+_NATIVE_SPAN_EN = 2
+_NATIVE_SPAN_KO = 3
+_NATIVE_SPAN_JA = 4
 
 
 def _normalize_spaces(text: str) -> str:
@@ -204,7 +211,15 @@ def _is_han_char(ch: str) -> bool:
 
 
 def _is_trivial_bridge_char(ch: str) -> bool:
-    return bool(ch) and _TRIVIAL_BRIDGE_PATTERN.fullmatch(ch) is not None
+    if not ch:
+        return False
+    codepoint = ord(ch)
+    return (
+        0x30 <= codepoint <= 0x39
+        or ch.isspace()
+        or ch in _ASCII_TRIVIAL_BRIDGE_CHARS
+        or ch in _UNICODE_TRIVIAL_BRIDGE_CHARS
+    )
 
 
 def _consume_direct_script_run(text: str, start: int, script: str) -> int:
@@ -293,65 +308,208 @@ def _merge_direct_and_resolved_specs(
     return _merge_segment_specs(merged_specs)
 
 
+def _resolve_selective_direct_native_rows(
+    texts: Sequence[str],
+    native_rows: Sequence[Sequence[Tuple[str, int]]],
+    language: str,
+) -> List[Tuple[List[str], List[str]]]:
+    per_text_specs: List[List[Tuple[str, str] | None]] = []
+    ambiguous_chunks: List[str] = []
+    lang_map = {
+        _NATIVE_SPAN_EN: "en",
+        _NATIVE_SPAN_KO: "ko",
+        _NATIVE_SPAN_JA: "ja",
+    }
+
+    for _text, row in zip(texts, native_rows):
+        specs: List[Tuple[str, str] | None] = []
+        for chunk, span_type in row:
+            if int(span_type) == _NATIVE_SPAN_AMBIGUOUS:
+                chunk_text = str(chunk)
+                specs.append(None)
+                ambiguous_chunks.append(chunk_text)
+            else:
+                specs.append((str(chunk), lang_map[int(span_type)]))
+        per_text_specs.append(specs)
+
+    resolved_specs: List[List[Tuple[str, str]]] = []
+    if ambiguous_chunks:
+        ambiguous_rows = LangSegmenter.getTextsBatch(ambiguous_chunks)
+        for items in ambiguous_rows:
+            textlist, langlist = _langsegmenter_items_to_segment_lists(items, language)
+            resolved_specs.append(list(zip(textlist, langlist)))
+
+    results: List[Tuple[List[str], List[str]]] = []
+    resolved_offset = 0
+    for specs in per_text_specs:
+        ambiguous_count = sum(1 for spec in specs if spec is None)
+        resolved_slice = resolved_specs[resolved_offset : resolved_offset + ambiguous_count]
+        resolved_offset += ambiguous_count
+        results.append(_merge_direct_and_resolved_specs(specs, resolved_slice))
+    return results
+
+
 def _split_texts_by_language_batch_selective_direct_runs(
     texts: Sequence[str],
     language: str,
 ) -> List[Tuple[List[str], List[str]]] | None:
     if str(language) not in {"auto", "auto_yue"}:
         return None
+    native_rows = scan_selective_direct_runs_native(texts)
+    if native_rows is not None:
+        return _resolve_selective_direct_native_rows(texts, native_rows, language)
     per_text_specs: List[List[Tuple[str, str] | None]] = []
     ambiguous_chunks: List[str] = []
     has_direct_run = False
+    ascii_trivial_bridge_chars = _ASCII_TRIVIAL_BRIDGE_CHARS
+    unicode_trivial_bridge_chars = _UNICODE_TRIVIAL_BRIDGE_CHARS
+    bridge_type = 1
+    en_type = 2
+    ko_type = 3
+    kana_type = 4
+    han_type = 5
 
     for raw_text in texts:
         text = str(raw_text)
         specs: List[Tuple[str, str] | None] = []
         cursor = 0
-        pending_bridge = ""
-        while cursor < len(text):
+        text_length = len(text)
+        char_types = bytearray(text_length)
+        for index, char in enumerate(text):
+            codepoint = ord(char)
+            if (
+                0x30 <= codepoint <= 0x39
+                or char.isspace()
+                or char in ascii_trivial_bridge_chars
+                or char in unicode_trivial_bridge_chars
+            ):
+                char_types[index] = bridge_type
+                continue
+            if (
+                0x41 <= codepoint <= 0x5A
+                or 0x61 <= codepoint <= 0x7A
+                or 0xFF21 <= codepoint <= 0xFF3A
+                or 0xFF41 <= codepoint <= 0xFF5A
+            ):
+                char_types[index] = en_type
+                continue
+            if (
+                0x1100 <= codepoint <= 0x11FF
+                or 0x3130 <= codepoint <= 0x318F
+                or 0xAC00 <= codepoint <= 0xD7AF
+            ):
+                char_types[index] = ko_type
+                continue
+            if 0x3040 <= codepoint <= 0x30FF or 0xFF66 <= codepoint <= 0xFF9D:
+                char_types[index] = kana_type
+                continue
+            if 0x4E00 <= codepoint <= 0x9FFF or codepoint == 0x3005:
+                char_types[index] = han_type
+
+        pending_bridge_start = -1
+        while cursor < text_length:
             current = text[cursor]
-            if _is_trivial_bridge_char(current):
-                pending_bridge += current
+            current_type = char_types[cursor]
+            if current_type == bridge_type:
+                if pending_bridge_start < 0:
+                    pending_bridge_start = cursor
                 cursor += 1
                 continue
 
-            if _is_ascii_or_fullwidth_latin(current):
-                end = _consume_direct_script_run(text, cursor, "en")
-                specs.append((pending_bridge + text[cursor:end], "en"))
-                pending_bridge = ""
+            segment_start = pending_bridge_start if pending_bridge_start >= 0 else cursor
+            pending_bridge_start = -1
+
+            if current_type == en_type:
+                cursor += 1
+                while cursor < text_length:
+                    next_char = text[cursor]
+                    next_type = char_types[cursor]
+                    if next_type == en_type or next_char.isdigit() or next_char in {"'", "_", "-"}:
+                        cursor += 1
+                        continue
+                    bridge_start = cursor
+                    while cursor < text_length and char_types[cursor] == bridge_type:
+                        cursor += 1
+                    if cursor >= text_length:
+                        cursor = bridge_start
+                        break
+                    next_char = text[cursor]
+                    next_type = char_types[cursor]
+                    if not (next_type == en_type or next_char.isdigit() or next_char in {"'", "_", "-"}):
+                        cursor = bridge_start
+                        break
+                specs.append((text[segment_start:cursor], "en"))
                 has_direct_run = True
-                cursor = end
                 continue
 
-            if _is_korean_char(current):
-                end = _consume_direct_script_run(text, cursor, "ko")
-                specs.append((pending_bridge + text[cursor:end], "ko"))
-                pending_bridge = ""
+            if current_type == ko_type:
+                cursor += 1
+                while cursor < text_length:
+                    if char_types[cursor] == ko_type:
+                        cursor += 1
+                        continue
+                    bridge_start = cursor
+                    while cursor < text_length and char_types[cursor] == bridge_type:
+                        cursor += 1
+                    if cursor >= text_length:
+                        cursor = bridge_start
+                        break
+                    if char_types[cursor] != ko_type:
+                        cursor = bridge_start
+                        break
+                specs.append((text[segment_start:cursor], "ko"))
                 has_direct_run = True
-                cursor = end
                 continue
 
-            if _is_kana_char(current) or _is_han_char(current):
-                end, saw_kana, saw_han = _consume_cjk_block(text, cursor)
-                chunk = pending_bridge + text[cursor:end]
-                pending_bridge = ""
+            if current_type == kana_type or current_type == han_type:
+                saw_kana = current_type == kana_type
+                saw_han = current_type == han_type
+                cursor += 1
+                last_core_end = cursor
+                while cursor < text_length:
+                    next_type = char_types[cursor]
+                    if next_type == han_type:
+                        saw_han = True
+                        cursor += 1
+                        last_core_end = cursor
+                        continue
+                    if next_type == kana_type:
+                        saw_kana = True
+                        cursor += 1
+                        last_core_end = cursor
+                        continue
+                    if next_type == bridge_type:
+                        cursor += 1
+                        continue
+                    break
+                chunk_end = last_core_end
+                chunk = text[segment_start:chunk_end]
                 if saw_kana and not saw_han:
                     specs.append((chunk, "ja"))
                     has_direct_run = True
                 else:
                     specs.append(None)
                     ambiguous_chunks.append(chunk)
-                cursor = end
+                cursor = chunk_end
                 continue
 
-            end = _consume_misc_ambiguous_block(text, cursor)
-            chunk = pending_bridge + text[cursor:end]
-            pending_bridge = ""
+            cursor += 1
+            last_core_end = cursor
+            while cursor < text_length:
+                next_type = char_types[cursor]
+                if next_type != 0 and next_type != bridge_type:
+                    break
+                cursor += 1
+                if next_type != bridge_type:
+                    last_core_end = cursor
+            chunk_end = last_core_end
+            chunk = text[segment_start:chunk_end]
             specs.append(None)
             ambiguous_chunks.append(chunk)
-            cursor = end
+            cursor = chunk_end
 
-        if pending_bridge:
+        if pending_bridge_start >= 0:
+            pending_bridge = text[pending_bridge_start:text_length]
             if specs:
                 last_spec = specs[-1]
                 if last_spec is None:

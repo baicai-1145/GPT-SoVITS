@@ -185,6 +185,9 @@ def preprocess_jap_batch(texts, with_prosody=False):
         phonemize_sentence = lambda sentence: pyopenjtalk.g2p(sentence).split(" ")
 
     rows = []
+    pending_sentence_refs = []
+    unique_sentences = []
+    sentence_to_index = {}
     for raw_text in texts:
         text = to_japanese(str(raw_text)).lower()
         sentences = re.split(split_marks, text)
@@ -192,12 +195,22 @@ def preprocess_jap_batch(texts, with_prosody=False):
         row = []
         for index, sentence in enumerate(sentences):
             if match_chars(sentence):
-                row.extend(phonemize_sentence(sentence))
+                sentence_index = sentence_to_index.get(sentence)
+                if sentence_index is None:
+                    sentence_index = len(unique_sentences)
+                    sentence_to_index[sentence] = sentence_index
+                    unique_sentences.append(sentence)
+                pending_sentence_refs.append((row, sentence_index))
             if index < len(marks):
                 if marks[index] == " ":
                     continue
                 row.append(post_marks(marks[index].replace(" ", "")))
         rows.append(row)
+    sentence_rows = []
+    if unique_sentences:
+        sentence_rows = [phonemize_sentence(sentence) for sentence in unique_sentences]
+    for row, sentence_index in pending_sentence_refs:
+        row.extend(sentence_rows[sentence_index])
     return rows
 
 

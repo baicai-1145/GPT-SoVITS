@@ -351,6 +351,9 @@ run_pip_quiet -r extra-req.txt --no-deps
 
 run_pip_quiet -r requirements.txt
 
+echo -e "${INFO}Installing Bundled split-lang From third_party/split-lang..."
+run_pip_quiet ./third_party/split-lang
+
 echo -e "${SUCCESS}Python Dependencies Installed"
 
 PY_PREFIX=$(python -c "import sys; print(sys.prefix)")

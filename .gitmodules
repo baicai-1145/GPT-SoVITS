@@ -1,3 +1,6 @@
 [submodule "third_party/g2pw-cu"]
 	path = third_party/g2pw-cu
 	url = https://github.com/baicai-1145/g2pw-cu.git
+[submodule "third_party/split-lang"]
+	path = third_party/split-lang
+	url = https://github.com/baicai-1145/split-lang.git
