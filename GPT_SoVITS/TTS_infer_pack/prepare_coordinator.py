@@ -1192,6 +1192,15 @@ class PrepareCoordinator:
                     "prompt_semantic_batch_samples": float(
                         prompt_semantic_profile.get("prompt_semantic_batch_samples", 0.0)
                     ),
+                    "prompt_semantic_padded_batch_samples": float(
+                        prompt_semantic_profile.get("prompt_semantic_padded_batch_samples", 0.0)
+                    ),
+                    "prompt_semantic_batch_pad_ratio": float(
+                        prompt_semantic_profile.get("prompt_semantic_batch_pad_ratio", 0.0)
+                    ),
+                    "prompt_semantic_ssl_skip_attention_mask": float(
+                        prompt_semantic_profile.get("prompt_semantic_ssl_skip_attention_mask", 0.0)
+                    ),
                     "prompt_semantic_pool_workers": float(
                         prompt_semantic_profile.get("prompt_semantic_pool_workers", 0.0)
                     ),

@@ -143,7 +143,9 @@ int g2pw_runtime_run(
     const float* phoneme_mask,
     const std::int64_t* char_ids,
     const std::int64_t* position_ids,
+    const std::int64_t* sequence_ids,
     std::int32_t batch_size,
+    std::int32_t sequence_batch_size,
     std::int32_t seq_len,
     float* probs) {
   auto* handle = static_cast<G2PWRuntimeHandle*>(raw_handle);
@@ -158,7 +160,9 @@ int g2pw_runtime_run(
     inputs.phoneme_mask = phoneme_mask;
     inputs.char_ids = char_ids;
     inputs.position_ids = position_ids;
+    inputs.sequence_ids = sequence_ids;
     inputs.batch_size = batch_size;
+    inputs.sequence_batch_size = sequence_batch_size;
     inputs.seq_len = seq_len;
 
     g2pw::InferenceOutputs outputs{};

@@ -15,6 +15,7 @@ from TTS_infer_pack.prepare_gpu_timeline import sync_timeline_cuda, trace_gpu_ba
 
 REF_AUDIO_MIN_SAMPLES_16K = 48000
 REF_AUDIO_MAX_SAMPLES_16K = 160000
+DEFAULT_REF_BATCH_BUCKETS = (80000, 96000, 112000, 128000, 169600)
 _RESAMPLE_CACHE_LOCK = threading.Lock()
 _RESAMPLE_CACHE: Dict[Tuple[int, int, str], torchaudio.transforms.Resample] = {}
 _RESAMPLE_STREAM_CACHE: Dict[str, torch.cuda.Stream] = {}
@@ -89,6 +90,19 @@ def conv1d_output_lengths(input_lengths: torch.Tensor, conv1d: torch.nn.Conv1d |
     return torch.clamp(output_lengths, min=0).to(dtype=torch.long)
 
 
+def parse_ref_batch_buckets(raw: str | None) -> List[int]:
+    values: List[int] = []
+    for item in str(raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(max(REF_AUDIO_MIN_SAMPLES_16K, int(item)))
+    if not values:
+        values = list(DEFAULT_REF_BATCH_BUCKETS)
+    values = sorted(set(values))
+    return values
+
+
 @dataclass
 class RefSemanticTask:
     raw_audio: torch.Tensor
@@ -129,14 +143,38 @@ class PrepareRefSemanticBatchWorker:
         self.max_batch_items = max(1, int(max_batch_items))
         self.max_batch_samples = max(REF_AUDIO_MIN_SAMPLES_16K + self.zero_wav_samples, int(max_batch_samples))
         self.shard_index = int(shard_index)
+        model_config = getattr(getattr(self.ssl_model, "model", None), "config", None)
+        feat_extract_norm = str(getattr(model_config, "feat_extract_norm", "") or "").strip().lower()
+        self.skip_attention_mask = (
+            str(
+                os.environ.get(
+                    "GPTSOVITS_PREPARE_REF_SSL_SKIP_ATTENTION_MASK",
+                    "1" if feat_extract_norm == "group" else "0",
+                )
+            )
+            .strip()
+            .lower()
+            not in {"0", "false", "no", "off"}
+        )
+        self.use_pinned_h2d = (
+            str(os.environ.get("GPTSOVITS_PREPARE_REF_PINNED_H2D", "1")).strip().lower()
+            not in {"0", "false", "no", "off"}
+            and str(self.device) != "cpu"
+            and torch.cuda.is_available()
+        )
+        self.bucket_upper_bounds = parse_ref_batch_buckets(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_BUCKETS"))
+        self.bucket_merge_distance = max(0, int(os.environ.get("GPTSOVITS_PREPARE_REF_BATCH_BUCKET_MERGE_DISTANCE", "2")))
 
         self.condition = threading.Condition()
-        self.pending_tasks: Deque[RefSemanticTask] = deque()
+        self.pending_tasks_by_bucket: Dict[int, Deque[RefSemanticTask]] = {
+            bucket_index: deque() for bucket_index in range(len(self.bucket_upper_bounds))
+        }
         self.pending_peak = 0
         self.total_submitted = 0
         self.total_finished = 0
         self.total_batches = 0
         self.active_batch_size = 0
+        self.active_batch_anchor_bucket_index = -1
         self.active_batch_peak = 0
         self.active_batch_samples = 0
         self.active_batch_samples_peak = 0
@@ -147,22 +185,89 @@ class PrepareRefSemanticBatchWorker:
         )
         self.worker_thread.start()
 
+    def _pending_count_locked(self) -> int:
+        return int(sum(len(queue) for queue in self.pending_tasks_by_bucket.values()))
+
+    def _pending_iter_locked(self):
+        for queue in self.pending_tasks_by_bucket.values():
+            for task in queue:
+                yield task
+
+    def _bucket_index_for_samples(self, sample_count: int) -> int:
+        target = max(REF_AUDIO_MIN_SAMPLES_16K, int(sample_count))
+        for index, upper_bound in enumerate(self.bucket_upper_bounds):
+            if target <= upper_bound:
+                return index
+        return max(0, len(self.bucket_upper_bounds) - 1)
+
+    def _bucket_index_for_task(self, task: RefSemanticTask) -> int:
+        return self._bucket_index_for_samples(self._estimate_task_samples(task))
+
+    def bucket_index_for_inputs(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> int:
+        task = RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr), wav16k=wav16k)
+        return self._bucket_index_for_task(task)
+
+    def _oldest_non_empty_bucket_index_locked(self) -> int | None:
+        selected_bucket = None
+        selected_created_at = None
+        for bucket_index, queue in self.pending_tasks_by_bucket.items():
+            if not queue:
+                continue
+            created_at = float(queue[0].created_at)
+            if selected_created_at is None or created_at < selected_created_at:
+                selected_bucket = bucket_index
+                selected_created_at = created_at
+        return selected_bucket
+
+    def _candidate_bucket_indices(self, anchor_bucket_index: int) -> List[int]:
+        start = max(0, int(anchor_bucket_index) - self.bucket_merge_distance)
+        end = min(len(self.bucket_upper_bounds) - 1, int(anchor_bucket_index) + self.bucket_merge_distance)
+        return list(range(start, end + 1))
+
     def pending_count(self) -> int:
         with self.condition:
-            return int(len(self.pending_tasks))
+            return self._pending_count_locked()
 
     def pending_samples(self) -> int:
         with self.condition:
-            return int(sum(self._estimate_task_samples(task) for task in self.pending_tasks))
+            return int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
 
     def outstanding_count(self) -> int:
         with self.condition:
-            return int(len(self.pending_tasks) + self.active_batch_size)
+            return int(self._pending_count_locked() + self.active_batch_size)
 
     def outstanding_samples(self) -> int:
         with self.condition:
-            pending_samples = int(sum(self._estimate_task_samples(task) for task in self.pending_tasks))
+            pending_samples = int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
             return int(pending_samples + self.active_batch_samples)
+
+    def routing_snapshot_for_bucket(self, bucket_index: int) -> Dict[str, int]:
+        with self.condition:
+            candidate_bucket_indices = self._candidate_bucket_indices(bucket_index)
+            pending_count = self._pending_count_locked()
+            pending_samples = int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
+            return {
+                "mergeable_pending": int(
+                    sum(len(self.pending_tasks_by_bucket[candidate_index]) for candidate_index in candidate_bucket_indices)
+                ),
+                "exact_pending": int(len(self.pending_tasks_by_bucket.get(bucket_index, ()))),
+                "pending": int(pending_count),
+                "outstanding": int(pending_count + self.active_batch_size),
+                "outstanding_samples": int(pending_samples + self.active_batch_samples),
+                "active_batch_size": int(self.active_batch_size),
+                "active_mergeable": int(
+                    self.active_batch_size > 0
+                    and self.active_batch_anchor_bucket_index >= 0
+                    and self.active_batch_anchor_bucket_index in candidate_bucket_indices
+                ),
+                "active_batch_anchor_bucket_index": int(self.active_batch_anchor_bucket_index),
+            }
 
     def _estimate_task_samples(self, task: RefSemanticTask) -> int:
         if task.wav16k is not None:
@@ -180,10 +285,12 @@ class PrepareRefSemanticBatchWorker:
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         task = RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr), wav16k=wav16k)
         with self.condition:
-            self.pending_tasks.append(task)
+            bucket_index = self._bucket_index_for_task(task)
+            self.pending_tasks_by_bucket[bucket_index].append(task)
             self.total_submitted += 1
-            if len(self.pending_tasks) > self.pending_peak:
-                self.pending_peak = len(self.pending_tasks)
+            pending_count = self._pending_count_locked()
+            if pending_count > self.pending_peak:
+                self.pending_peak = pending_count
             self.condition.notify_all()
         task.done_event.wait()
         if task.error is not None:
@@ -207,10 +314,12 @@ class PrepareRefSemanticBatchWorker:
             done_future=loop.create_future(),
         )
         with self.condition:
-            self.pending_tasks.append(task)
+            bucket_index = self._bucket_index_for_task(task)
+            self.pending_tasks_by_bucket[bucket_index].append(task)
             self.total_submitted += 1
-            if len(self.pending_tasks) > self.pending_peak:
-                self.pending_peak = len(self.pending_tasks)
+            pending_count = self._pending_count_locked()
+            if pending_count > self.pending_peak:
+                self.pending_peak = pending_count
             self.condition.notify_all()
         return await task.done_future
 
@@ -235,54 +344,87 @@ class PrepareRefSemanticBatchWorker:
 
     def snapshot(self) -> Dict[str, int]:
         with self.condition:
+            pending_count = self._pending_count_locked()
+            pending_samples = int(sum(self._estimate_task_samples(task) for task in self._pending_iter_locked()))
             return {
                 "shard_index": self.shard_index,
-                "pending": len(self.pending_tasks),
+                "pending": pending_count,
                 "pending_peak": self.pending_peak,
                 "total_submitted": self.total_submitted,
                 "total_finished": self.total_finished,
                 "total_batches": self.total_batches,
                 "active_batch_size": self.active_batch_size,
+                "active_batch_anchor_bucket_index": self.active_batch_anchor_bucket_index,
                 "active_batch_peak": self.active_batch_peak,
                 "active_batch_samples": self.active_batch_samples,
                 "active_batch_samples_peak": self.active_batch_samples_peak,
-                "outstanding": len(self.pending_tasks) + self.active_batch_size,
-                "outstanding_samples": int(
-                    sum(self._estimate_task_samples(task) for task in self.pending_tasks) + self.active_batch_samples
-                ),
+                "outstanding": pending_count + self.active_batch_size,
+                "outstanding_samples": int(pending_samples + self.active_batch_samples),
                 "batch_window_ms": int(self.batch_window_s * 1000.0),
                 "max_batch_items": self.max_batch_items,
                 "max_batch_samples": self.max_batch_samples,
+                "bucket_upper_bounds": list(self.bucket_upper_bounds),
+                "pending_buckets": {
+                    str(self.bucket_upper_bounds[bucket_index]): len(queue)
+                    for bucket_index, queue in self.pending_tasks_by_bucket.items()
+                },
             }
 
     def _collect_batch(self) -> tuple[List[RefSemanticTask], float]:
         with self.condition:
-            while not self.pending_tasks:
+            while self._pending_count_locked() <= 0:
                 self.condition.wait()
 
-            first_task = self.pending_tasks.popleft()
+            selected_bucket_index = self._oldest_non_empty_bucket_index_locked()
+            if selected_bucket_index is None:
+                raise RuntimeError("ref semantic pending bucket missing")
+            selected_queue = self.pending_tasks_by_bucket[selected_bucket_index]
+            first_task = selected_queue.popleft()
             first_task.batch_popped_at = time.perf_counter()
             batch: List[RefSemanticTask] = [first_task]
             batch_samples = self._estimate_task_samples(batch[0])
+            batch_max_task_samples = batch_samples
             deadline = time.perf_counter() + self.batch_window_s
 
             while len(batch) < self.max_batch_items:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
-                if not self.pending_tasks:
+                if not any(self.pending_tasks_by_bucket[bucket_index] for bucket_index in self._candidate_bucket_indices(selected_bucket_index)):
                     self.condition.wait(timeout=remaining)
                     continue
-                next_task = self.pending_tasks[0]
-                next_samples = self._estimate_task_samples(next_task)
-                if len(batch) >= self.max_batch_items or (batch_samples + next_samples) > self.max_batch_samples:
+
+                chosen_bucket_index = None
+                chosen_task = None
+                chosen_samples = 0
+                chosen_padded_cost = None
+                for bucket_index in self._candidate_bucket_indices(selected_bucket_index):
+                    bucket_queue = self.pending_tasks_by_bucket[bucket_index]
+                    if not bucket_queue:
+                        continue
+                    candidate_task = bucket_queue[0]
+                    candidate_samples = self._estimate_task_samples(candidate_task)
+                    if (batch_samples + candidate_samples) > self.max_batch_samples:
+                        continue
+                    next_max_task_samples = max(batch_max_task_samples, candidate_samples)
+                    padded_cost = next_max_task_samples * (len(batch) + 1)
+                    if chosen_padded_cost is None or padded_cost < chosen_padded_cost:
+                        chosen_bucket_index = bucket_index
+                        chosen_task = candidate_task
+                        chosen_samples = candidate_samples
+                        chosen_padded_cost = padded_cost
+
+                if chosen_task is None or chosen_bucket_index is None:
                     break
-                popped_task = self.pending_tasks.popleft()
+
+                popped_task = self.pending_tasks_by_bucket[chosen_bucket_index].popleft()
                 popped_task.batch_popped_at = time.perf_counter()
                 batch.append(popped_task)
-                batch_samples += next_samples
+                batch_samples += chosen_samples
+                batch_max_task_samples = max(batch_max_task_samples, chosen_samples)
 
             self.active_batch_size = len(batch)
+            self.active_batch_anchor_bucket_index = int(selected_bucket_index)
             self.active_batch_samples = batch_samples
             if self.active_batch_size > self.active_batch_peak:
                 self.active_batch_peak = self.active_batch_size
@@ -293,6 +435,7 @@ class PrepareRefSemanticBatchWorker:
     def _finalize_batch(self, batch: List[RefSemanticTask]) -> None:
         with self.condition:
             self.active_batch_size = 0
+            self.active_batch_anchor_bucket_index = -1
             self.active_batch_samples = 0
             self.total_batches += 1
             self.total_finished += len(batch)
@@ -306,6 +449,13 @@ class PrepareRefSemanticBatchWorker:
         if hasattr(model, "_get_feat_extract_output_lengths"):
             return model._get_feat_extract_output_lengths(raw_lengths).to(dtype=torch.long)
         return torch.full((attention_mask.shape[0],), int(hidden_length), dtype=torch.long, device=attention_mask.device)
+
+    def _get_hidden_lengths_from_raw_lengths(self, raw_lengths: torch.Tensor, hidden_length: int, device) -> torch.Tensor:
+        model = self.ssl_model.model
+        raw_lengths = raw_lengths.to(device=device, dtype=torch.long)
+        if hasattr(model, "_get_feat_extract_output_lengths"):
+            return model._get_feat_extract_output_lengths(raw_lengths).to(dtype=torch.long)
+        return torch.full((raw_lengths.shape[0],), int(hidden_length), dtype=torch.long, device=device)
 
     @torch.inference_mode()
     def _run_batch(self, batch: List[RefSemanticTask], batch_collected_at: float) -> None:
@@ -322,14 +472,20 @@ class PrepareRefSemanticBatchWorker:
         wav_lengths = torch.tensor([int(wav.shape[0]) for wav in prepared_wavs], dtype=torch.long)
         batch_samples = int(wav_lengths.sum().item())
         max_wav_len = int(wav_lengths.max().item())
+        padded_batch_samples = int(len(batch) * max_wav_len)
+        batch_pad_ratio = 0.0 if padded_batch_samples <= 0 else max(0.0, 1.0 - (batch_samples / padded_batch_samples))
 
         pack_start = time.perf_counter()
-        input_values_cpu = torch.zeros((len(batch), max_wav_len), dtype=torch.float32)
-        attention_mask_cpu = torch.zeros((len(batch), max_wav_len), dtype=torch.long)
+        pin_memory = bool(self.use_pinned_h2d)
+        input_values_cpu = torch.zeros((len(batch), max_wav_len), dtype=torch.float32, pin_memory=pin_memory)
+        attention_mask_cpu = None
+        if not self.skip_attention_mask:
+            attention_mask_cpu = torch.zeros((len(batch), max_wav_len), dtype=torch.long, pin_memory=pin_memory)
         for batch_index, wav in enumerate(prepared_wavs):
             wav_len = int(wav.shape[0])
             input_values_cpu[batch_index, :wav_len] = wav
-            attention_mask_cpu[batch_index, :wav_len] = 1
+            if attention_mask_cpu is not None:
+                attention_mask_cpu[batch_index, :wav_len] = 1
         pack_end = time.perf_counter()
         pack_ms = (pack_end - pack_start) * 1000.0
 
@@ -348,8 +504,10 @@ class PrepareRefSemanticBatchWorker:
         if self.stage_limiter is None:
             h2d_start = time.perf_counter()
             h2d_start_ts = h2d_start
-            input_values = input_values_cpu.to(self.device)
-            attention_mask = attention_mask_cpu.to(self.device)
+            input_values = input_values_cpu.to(self.device, non_blocking=pin_memory)
+            attention_mask = None
+            if attention_mask_cpu is not None:
+                attention_mask = attention_mask_cpu.to(self.device, non_blocking=pin_memory)
             if self.is_half:
                 input_values = input_values.half()
             h2d_end_ts = time.perf_counter()
@@ -358,13 +516,23 @@ class PrepareRefSemanticBatchWorker:
             with torch.inference_mode():
                 ssl_start = time.perf_counter()
                 ssl_start_ts = ssl_start
-                outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
+                if attention_mask is None:
+                    outputs = self.ssl_model.model(input_values)
+                else:
+                    outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
                 sync_timeline_cuda(self.device)
                 ssl_end_ts = time.perf_counter()
                 ssl_forward_ms = (ssl_end_ts - ssl_start) * 1000.0
                 hubert_feature = outputs["last_hidden_state"].transpose(1, 2)
                 hidden_length_start = time.perf_counter()
-                hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
+                if attention_mask is None:
+                    hidden_lengths = self._get_hidden_lengths_from_raw_lengths(
+                        wav_lengths,
+                        int(hubert_feature.shape[-1]),
+                        hubert_feature.device,
+                    )
+                else:
+                    hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
                 hidden_length_ms = (time.perf_counter() - hidden_length_start) * 1000.0
                 latent_start = time.perf_counter()
                 latent_start_ts = latent_start
@@ -377,8 +545,10 @@ class PrepareRefSemanticBatchWorker:
                 gpu_acquired_ts = time.perf_counter()
                 h2d_start = gpu_acquired_ts
                 h2d_start_ts = h2d_start
-                input_values = input_values_cpu.to(self.device)
-                attention_mask = attention_mask_cpu.to(self.device)
+                input_values = input_values_cpu.to(self.device, non_blocking=pin_memory)
+                attention_mask = None
+                if attention_mask_cpu is not None:
+                    attention_mask = attention_mask_cpu.to(self.device, non_blocking=pin_memory)
                 if self.is_half:
                     input_values = input_values.half()
                 h2d_end_ts = time.perf_counter()
@@ -386,13 +556,23 @@ class PrepareRefSemanticBatchWorker:
                 with torch.inference_mode():
                     ssl_start = time.perf_counter()
                     ssl_start_ts = ssl_start
-                    outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
+                    if attention_mask is None:
+                        outputs = self.ssl_model.model(input_values)
+                    else:
+                        outputs = self.ssl_model.model(input_values, attention_mask=attention_mask)
                     sync_timeline_cuda(self.device)
                     ssl_end_ts = time.perf_counter()
                     ssl_forward_ms = (ssl_end_ts - ssl_start) * 1000.0
                     hubert_feature = outputs["last_hidden_state"].transpose(1, 2)
                     hidden_length_start = time.perf_counter()
-                    hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
+                    if attention_mask is None:
+                        hidden_lengths = self._get_hidden_lengths_from_raw_lengths(
+                            wav_lengths,
+                            int(hubert_feature.shape[-1]),
+                            hubert_feature.device,
+                        )
+                    else:
+                        hidden_lengths = self._get_hidden_lengths(attention_mask, int(hubert_feature.shape[-1]))
                     hidden_length_ms = (time.perf_counter() - hidden_length_start) * 1000.0
                     latent_start = time.perf_counter()
                     latent_start_ts = latent_start
@@ -437,6 +617,9 @@ class PrepareRefSemanticBatchWorker:
                     "prompt_semantic_stage_inflight_peak": float(limiter_stats["peak_inflight"]),
                     "prompt_semantic_batch_size": float(len(batch)),
                     "prompt_semantic_batch_samples": float(batch_samples),
+                    "prompt_semantic_padded_batch_samples": float(padded_batch_samples),
+                    "prompt_semantic_batch_pad_ratio": float(batch_pad_ratio),
+                    "prompt_semantic_ssl_skip_attention_mask": 1.0 if attention_mask_cpu is None else 0.0,
                 }
             except Exception as exc:  # noqa: PERF203
                 task.error = exc
@@ -516,6 +699,14 @@ class PrepareRefSemanticBatchWorkerPool:
     ):
         self.worker_count = max(1, int(worker_count))
         self.lock = threading.Lock()
+        self.bucket_aware_sharding = (
+            str(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_SHARDING", "0")).strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
+        self.bucket_aware_max_outstanding_gap = max(
+            0,
+            int(os.environ.get("GPTSOVITS_PREPARE_REF_BUCKET_AWARE_MAX_OUTSTANDING_GAP", "2")),
+        )
         self.shards = [
             PrepareRefSemanticBatchWorker(
                 ssl_model=ssl_model,
@@ -532,8 +723,38 @@ class PrepareRefSemanticBatchWorkerPool:
             for index in range(self.worker_count)
         ]
 
-    def _pick_shard(self) -> PrepareRefSemanticBatchWorker:
+    def _bucket_index_for_inputs(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> int:
+        return self.shards[0].bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
+
+    def _pick_shard(self, bucket_index: int | None = None) -> PrepareRefSemanticBatchWorker:
         with self.lock:
+            if self.bucket_aware_sharding and bucket_index is not None and self.worker_count > 1:
+                shard_states = [(shard, shard.routing_snapshot_for_bucket(bucket_index)) for shard in self.shards]
+                min_outstanding = min(int(state["outstanding"]) for _, state in shard_states)
+                preferred_states = [
+                    (shard, state)
+                    for shard, state in shard_states
+                    if int(state["mergeable_pending"]) > 0
+                    and int(state["outstanding"]) <= (min_outstanding + self.bucket_aware_max_outstanding_gap)
+                ]
+                if preferred_states:
+                    return min(
+                        preferred_states,
+                        key=lambda item: (
+                            -int(item[1]["mergeable_pending"]),
+                            -int(item[1]["exact_pending"]),
+                            int(item[1]["outstanding"]),
+                            int(item[1]["outstanding_samples"]),
+                            0 if int(item[1]["active_mergeable"]) > 0 else 1,
+                            item[0].shard_index,
+                        ),
+                    )[0]
             return min(
                 self.shards,
                 key=lambda shard: (
@@ -551,9 +772,11 @@ class PrepareRefSemanticBatchWorkerPool:
         *,
         wav16k: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        shard = self._pick_shard()
+        bucket_index = self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
+        shard = self._pick_shard(bucket_index)
         result, profile = shard.submit(raw_audio, raw_sr, wav16k=wav16k)
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
+        profile["prompt_semantic_pool_bucket_index"] = float(bucket_index)
         return result, profile
 
     async def submit_async(
@@ -563,15 +786,19 @@ class PrepareRefSemanticBatchWorkerPool:
         *,
         wav16k: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        shard = self._pick_shard()
+        bucket_index = self._bucket_index_for_inputs(raw_audio, raw_sr, wav16k=wav16k)
+        shard = self._pick_shard(bucket_index)
         result, profile = await shard.submit_async(raw_audio, raw_sr, wav16k=wav16k)
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
+        profile["prompt_semantic_pool_bucket_index"] = float(bucket_index)
         return result, profile
 
     def snapshot(self) -> Dict[str, int | List[Dict[str, int]]]:
         shard_snapshots = [dict(shard.snapshot()) for shard in self.shards]
         return {
             "worker_count": int(self.worker_count),
+            "bucket_aware_sharding": int(self.bucket_aware_sharding),
+            "bucket_aware_max_outstanding_gap": int(self.bucket_aware_max_outstanding_gap),
             "pending": int(sum(int(snapshot.get("pending", 0)) for snapshot in shard_snapshots)),
             "pending_peak": int(max((int(snapshot.get("pending_peak", 0)) for snapshot in shard_snapshots), default=0)),
             "outstanding": int(sum(int(snapshot.get("outstanding", 0)) for snapshot in shard_snapshots)),

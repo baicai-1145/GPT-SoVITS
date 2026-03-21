@@ -176,6 +176,8 @@ def _load_bridge():
         ctypes.c_void_p,
         ctypes.c_void_p,
         ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int32,
         ctypes.c_int32,
         ctypes.c_int32,
         ctypes.c_void_p,
@@ -325,10 +327,38 @@ class G2PWRuntimeWrapper:
         char_ids = np.ascontiguousarray(model_input["char_ids"], dtype=np.int64)
         position_ids = np.ascontiguousarray(model_input["position_ids"], dtype=np.int64)
         batch_size = int(char_ids.shape[0])
-        if input_ids.shape[0] == 1 and batch_size > 1:
-            input_ids = np.ascontiguousarray(np.repeat(input_ids, batch_size, axis=0), dtype=np.int64)
-            token_type_ids = np.ascontiguousarray(np.repeat(token_type_ids, batch_size, axis=0), dtype=np.int64)
-            attention_masks = np.ascontiguousarray(np.repeat(attention_masks, batch_size, axis=0), dtype=np.int64)
+        sequence_batch_size = int(input_ids.shape[0])
+        sequence_ids_raw = model_input.get("sequence_ids")
+        if sequence_ids_raw is None:
+            if sequence_batch_size == batch_size:
+                sequence_ids = np.arange(batch_size, dtype=np.int64)
+            elif sequence_batch_size == 1 and batch_size >= 1:
+                sequence_ids = np.zeros((batch_size,), dtype=np.int64)
+            else:
+                raise G2PWCudaError(
+                    "model_input 缺少 sequence_ids，且 input/query 批大小不匹配: "
+                    f"sequence_batch_size={sequence_batch_size} query_batch_size={batch_size}"
+                )
+        else:
+            sequence_ids = np.ascontiguousarray(sequence_ids_raw, dtype=np.int64)
+            if sequence_ids.ndim != 1 or int(sequence_ids.shape[0]) != batch_size:
+                raise G2PWCudaError(
+                    "sequence_ids 形状无效: "
+                    f"expected=({batch_size},) actual={tuple(sequence_ids.shape)}"
+                )
+        if sequence_batch_size <= 0 or batch_size <= 0:
+            raise G2PWCudaError(
+                "model_input 批大小无效: "
+                f"sequence_batch_size={sequence_batch_size} query_batch_size={batch_size}"
+            )
+        min_sequence_id = int(sequence_ids.min()) if batch_size > 0 else 0
+        max_sequence_id = int(sequence_ids.max()) if batch_size > 0 else 0
+        if min_sequence_id < 0 or max_sequence_id >= sequence_batch_size:
+            raise G2PWCudaError(
+                "sequence_ids 超出 sequence batch 范围: "
+                f"min_sequence_id={min_sequence_id} max_sequence_id={max_sequence_id} "
+                f"sequence_batch_size={sequence_batch_size}"
+            )
         return {
             "input_ids": input_ids,
             "token_type_ids": token_type_ids,
@@ -336,6 +366,7 @@ class G2PWRuntimeWrapper:
             "phoneme_masks": phoneme_masks,
             "char_ids": char_ids,
             "position_ids": position_ids,
+            "sequence_ids": sequence_ids,
         }
 
     def _run_direct(self, model_input: Dict[str, np.ndarray]) -> np.ndarray:
@@ -346,11 +377,13 @@ class G2PWRuntimeWrapper:
         phoneme_masks = normalized["phoneme_masks"]
         char_ids = normalized["char_ids"]
         position_ids = normalized["position_ids"]
+        sequence_ids = normalized["sequence_ids"]
         batch_size = int(char_ids.shape[0])
+        sequence_batch_size = int(input_ids.shape[0])
         seq_len = int(input_ids.shape[1])
         probs = np.empty((batch_size, self.num_labels), dtype=np.float32)
         with self.lock:
-            self._ensure_capacity(batch_size=batch_size, seq_len=seq_len)
+            self._ensure_capacity(batch_size=max(batch_size, sequence_batch_size), seq_len=seq_len)
             status = self.lib.g2pw_runtime_run(
                 self.handle,
                 input_ids.ctypes.data_as(ctypes.c_void_p),
@@ -359,7 +392,9 @@ class G2PWRuntimeWrapper:
                 phoneme_masks.ctypes.data_as(ctypes.c_void_p),
                 char_ids.ctypes.data_as(ctypes.c_void_p),
                 position_ids.ctypes.data_as(ctypes.c_void_p),
+                sequence_ids.ctypes.data_as(ctypes.c_void_p),
                 batch_size,
+                sequence_batch_size,
                 seq_len,
                 probs.ctypes.data_as(ctypes.c_void_p),
             )
@@ -377,34 +412,41 @@ class G2PWRuntimeWrapper:
         if total_rows > self.batch_max_rows:
             return False
         total_tokens = sum(
-            int(item.model_input["char_ids"].shape[0]) * int(item.model_input["input_ids"].shape[1]) for item in tasks
-        ) + int(candidate.model_input["char_ids"].shape[0]) * int(candidate.model_input["input_ids"].shape[1])
+            int(item.model_input["input_ids"].shape[0]) * int(item.model_input["input_ids"].shape[1]) for item in tasks
+        ) + int(candidate.model_input["input_ids"].shape[0]) * int(candidate.model_input["input_ids"].shape[1])
         return total_tokens <= self.batch_max_tokens
 
     def _merge_batch_inputs(self, tasks: List[G2PWBatchTask]) -> Tuple[Dict[str, np.ndarray], List[Tuple[int, int]]]:
         normalized_inputs = [self._normalize_model_input(task.model_input) for task in tasks]
-        total_rows = sum(int(item["char_ids"].shape[0]) for item in normalized_inputs)
+        total_query_rows = sum(int(item["char_ids"].shape[0]) for item in normalized_inputs)
+        total_sequence_rows = sum(int(item["input_ids"].shape[0]) for item in normalized_inputs)
         max_seq_len = max(int(item["input_ids"].shape[1]) for item in normalized_inputs)
-        input_ids = np.zeros((total_rows, max_seq_len), dtype=np.int64)
-        token_type_ids = np.zeros((total_rows, max_seq_len), dtype=np.int64)
-        attention_masks = np.zeros((total_rows, max_seq_len), dtype=np.int64)
-        phoneme_masks = np.zeros((total_rows, normalized_inputs[0]["phoneme_masks"].shape[1]), dtype=np.float32)
-        char_ids = np.zeros((total_rows,), dtype=np.int64)
-        position_ids = np.zeros((total_rows,), dtype=np.int64)
+        input_ids = np.zeros((total_sequence_rows, max_seq_len), dtype=np.int64)
+        token_type_ids = np.zeros((total_sequence_rows, max_seq_len), dtype=np.int64)
+        attention_masks = np.zeros((total_sequence_rows, max_seq_len), dtype=np.int64)
+        phoneme_masks = np.zeros((total_query_rows, normalized_inputs[0]["phoneme_masks"].shape[1]), dtype=np.float32)
+        char_ids = np.zeros((total_query_rows,), dtype=np.int64)
+        position_ids = np.zeros((total_query_rows,), dtype=np.int64)
+        sequence_ids = np.zeros((total_query_rows,), dtype=np.int64)
         slices: List[Tuple[int, int]] = []
-        cursor = 0
+        query_cursor = 0
+        sequence_cursor = 0
         for item in normalized_inputs:
+            sequence_rows = int(item["input_ids"].shape[0])
             rows = int(item["char_ids"].shape[0])
             seq_len = int(item["input_ids"].shape[1])
-            next_cursor = cursor + rows
-            input_ids[cursor:next_cursor, :seq_len] = item["input_ids"]
-            token_type_ids[cursor:next_cursor, :seq_len] = item["token_type_ids"]
-            attention_masks[cursor:next_cursor, :seq_len] = item["attention_masks"]
-            phoneme_masks[cursor:next_cursor] = item["phoneme_masks"]
-            char_ids[cursor:next_cursor] = item["char_ids"]
-            position_ids[cursor:next_cursor] = item["position_ids"]
-            slices.append((cursor, next_cursor))
-            cursor = next_cursor
+            next_sequence_cursor = sequence_cursor + sequence_rows
+            next_query_cursor = query_cursor + rows
+            input_ids[sequence_cursor:next_sequence_cursor, :seq_len] = item["input_ids"]
+            token_type_ids[sequence_cursor:next_sequence_cursor, :seq_len] = item["token_type_ids"]
+            attention_masks[sequence_cursor:next_sequence_cursor, :seq_len] = item["attention_masks"]
+            phoneme_masks[query_cursor:next_query_cursor] = item["phoneme_masks"]
+            char_ids[query_cursor:next_query_cursor] = item["char_ids"]
+            position_ids[query_cursor:next_query_cursor] = item["position_ids"]
+            sequence_ids[query_cursor:next_query_cursor] = item["sequence_ids"] + sequence_cursor
+            slices.append((query_cursor, next_query_cursor))
+            query_cursor = next_query_cursor
+            sequence_cursor = next_sequence_cursor
         return {
             "input_ids": input_ids,
             "token_type_ids": token_type_ids,
@@ -412,6 +454,7 @@ class G2PWRuntimeWrapper:
             "phoneme_masks": phoneme_masks,
             "char_ids": char_ids,
             "position_ids": position_ids,
+            "sequence_ids": sequence_ids,
         }, slices
 
     def _finish_task(

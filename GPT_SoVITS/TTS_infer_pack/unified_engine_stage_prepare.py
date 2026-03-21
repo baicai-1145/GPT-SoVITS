@@ -26,6 +26,15 @@ class EnginePrepareStageMixin:
             + int(self.prepare_ref_spec_queue_owner.waiting_count())
         )
 
+    @staticmethod
+    def _engine_prepare_audio_first_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_ENGINE_PREPARE_AUDIO_FIRST", "0")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
     async def _wait_prepare_queue_admission(self) -> float:
         soft_max = max(0, int(os.environ.get("GPTSOVITS_ENGINE_PREPARE_QUEUE_SOFT_MAX", "0")))
         if soft_max <= 0:
@@ -296,6 +305,8 @@ class EnginePrepareStageMixin:
     def run_engine_prepare_once(self) -> bool:
         prepare_batch_policy = self.scheduler_worker.get_prepare_batch_policy()
         batch_max_items = int(prepare_batch_policy.get("prepare_batch_max_items", 1))
+        if self._engine_prepare_audio_first_enabled() and self.prepare_queue_owner.has_items():
+            return self._run_engine_prepare_audio_once(batch_max_items)
         audio_age_ms = self.prepare_queue_owner.peek_oldest_age_ms("enqueue_time")
         text_age_ms = self.prepare_text_queue_owner.peek_oldest_age_ms("enqueue_time")
         if self.prepare_text_queue_owner.has_items() and (
