@@ -10,6 +10,15 @@ from GPT_SoVITS.TTS_infer_pack.unified_engine_components import EngineGpuPrepare
 
 
 class EnginePrepareStageMixin:
+    @staticmethod
+    def _engine_prepare_ref_wav16k_preload_enabled() -> bool:
+        return str(os.environ.get("GPTSOVITS_ENGINE_PREPARE_REF_WAV16K_PRELOAD", "1")).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
     def _prepare_waiting_total(self) -> int:
         return (
             int(self.prepare_queue_owner.waiting_count())
@@ -64,6 +73,11 @@ class EnginePrepareStageMixin:
             audio_enqueue_time=time.perf_counter(),
             admission_wait_ms=float(prepare_queue_admission_wait_ms),
         )
+        if self._engine_prepare_ref_wav16k_preload_enabled():
+            task.ref_audio_prepare_future = self.scheduler_worker.submit_prepare_ref_audio_asset(
+                str(cpu_stage.spec.ref_audio_path),
+                submit_at=float(task.audio_enqueue_time),
+            )
         self.prepare_queue_owner.enqueue(task)
         self.notify_arbiter()
         return await done_future
@@ -129,7 +143,12 @@ class EnginePrepareStageMixin:
         queue_wait_ms_list = [max(0.0, (now - task.enqueue_time) * 1000.0) for task in tasks]
         for task in tasks:
             task.audio_start_time = float(now)
-        batch_results = asyncio.run(self.scheduler_worker.prepare_gpu_audio_phases_async([task.cpu_stage for task in tasks]))
+        batch_results = asyncio.run(
+            self.scheduler_worker.prepare_gpu_audio_phases_async(
+                [task.cpu_stage for task in tasks],
+                [task.ref_audio_prepare_future for task in tasks],
+            )
+        )
         completed_count = 0
         for task, queue_wait_ms, result in zip(tasks, queue_wait_ms_list, batch_results):
             task.audio_end_time = time.perf_counter()

@@ -93,6 +93,7 @@ def conv1d_output_lengths(input_lengths: torch.Tensor, conv1d: torch.nn.Conv1d |
 class RefSemanticTask:
     raw_audio: torch.Tensor
     raw_sr: int
+    wav16k: torch.Tensor | None = None
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.perf_counter)
     batch_popped_at: float = 0.0
@@ -164,12 +165,20 @@ class PrepareRefSemanticBatchWorker:
             return int(pending_samples + self.active_batch_samples)
 
     def _estimate_task_samples(self, task: RefSemanticTask) -> int:
+        if task.wav16k is not None:
+            return int(task.wav16k.shape[-1])
         raw_len = int(task.raw_audio.shape[-1]) if task.raw_audio.dim() > 0 else 0
         base = int(round(raw_len * 16000.0 / max(1, int(task.raw_sr))))
         return max(REF_AUDIO_MIN_SAMPLES_16K, base) + self.zero_wav_samples
 
-    def submit(self, raw_audio: torch.Tensor, raw_sr: int) -> Tuple[torch.Tensor, Dict[str, float]]:
-        task = RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr))
+    def submit(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        task = RefSemanticTask(raw_audio=raw_audio, raw_sr=int(raw_sr), wav16k=wav16k)
         with self.condition:
             self.pending_tasks.append(task)
             self.total_submitted += 1
@@ -182,11 +191,18 @@ class PrepareRefSemanticBatchWorker:
         assert task.result_prompt_semantic is not None
         return task.result_prompt_semantic, dict(task.profile)
 
-    async def submit_async(self, raw_audio: torch.Tensor, raw_sr: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+    async def submit_async(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         loop = asyncio.get_running_loop()
         task = RefSemanticTask(
             raw_audio=raw_audio,
             raw_sr=int(raw_sr),
+            wav16k=wav16k,
             done_loop=loop,
             done_future=loop.create_future(),
         )
@@ -296,7 +312,10 @@ class PrepareRefSemanticBatchWorker:
         batch_started = time.perf_counter()
         prepared_start = time.perf_counter()
         prepared_wavs = [
-            prepare_prompt_semantic_wav16k(task.raw_audio, int(task.raw_sr), self.zero_wav_samples) for task in batch
+            task.wav16k
+            if task.wav16k is not None
+            else prepare_prompt_semantic_wav16k(task.raw_audio, int(task.raw_sr), self.zero_wav_samples)
+            for task in batch
         ]
         prepared_end = time.perf_counter()
         cpu_prepare_ms = (time.perf_counter() - prepared_start) * 1000.0
@@ -525,15 +544,27 @@ class PrepareRefSemanticBatchWorkerPool:
                 ),
             )
 
-    def submit(self, raw_audio: torch.Tensor, raw_sr: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def submit(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         shard = self._pick_shard()
-        result, profile = shard.submit(raw_audio, raw_sr)
+        result, profile = shard.submit(raw_audio, raw_sr, wav16k=wav16k)
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
         return result, profile
 
-    async def submit_async(self, raw_audio: torch.Tensor, raw_sr: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+    async def submit_async(
+        self,
+        raw_audio: torch.Tensor,
+        raw_sr: int,
+        *,
+        wav16k: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         shard = self._pick_shard()
-        result, profile = await shard.submit_async(raw_audio, raw_sr)
+        result, profile = await shard.submit_async(raw_audio, raw_sr, wav16k=wav16k)
         profile["prompt_semantic_pool_workers"] = float(self.worker_count)
         return result, profile
 

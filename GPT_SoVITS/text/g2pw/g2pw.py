@@ -68,6 +68,12 @@ class G2PWPinyin(Pinyin):
     def get_seg(self, **kwargs):
         return simple_seg
 
+    def prewarm(self, sentences=None, rounds: int = 1) -> bool:
+        backend = getattr(self, "_g2pw", None)
+        if backend is None or not hasattr(backend, "prewarm"):
+            return False
+        return bool(backend.prewarm(sentences=sentences, rounds=rounds))
+
 
 class Converter(UltimateConverter):
     def __init__(self, g2pw_instance, v_to_u=False, neutral_tone_with_five=False, tone_sandhi=False, **kwargs):

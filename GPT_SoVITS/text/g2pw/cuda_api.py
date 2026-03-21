@@ -665,6 +665,8 @@ class G2PWCudaConverter(_G2PWBaseOnnxConverter):
         self.device = f"cuda:{primary_runtime.device_ordinal}"
         self.checkpoint_path = str(primary_runtime.weights_path)
         self.providers = ["g2pw-cu"]
+        self._prewarm_lock = threading.Lock()
+        self._prewarmed = False
 
     def _predict(self, model_input: Dict[str, Any]) -> Tuple[List[str], List[float]]:
         probs = self.runtime.run(model_input)
@@ -684,3 +686,22 @@ class G2PWCudaConverter(_G2PWBaseOnnxConverter):
 
     def snapshot(self) -> Dict[str, float | int | bool]:
         return dict(self.runtime.snapshot())
+
+    def prewarm(self, sentences: List[str] | None = None, rounds: int = 1) -> bool:
+        with self._prewarm_lock:
+            if self._prewarmed:
+                return False
+            warm_sentences = list(sentences or [
+                "重庆银行的行长在长安见到了重要的人。",
+                "音乐老师重新调整了长句里的重音和节奏。",
+                "我们准备把参考文本和目标文本一起处理。",
+                "这个系统需要在高并发下稳定完成预处理。",
+            ])
+            warm_sentences = [str(item).strip() for item in warm_sentences if str(item).strip()]
+            if not warm_sentences:
+                warm_sentences = ["重庆银行的行长在长安见到了重要的人。"]
+            warm_rounds = max(1, int(rounds))
+            for _ in range(warm_rounds):
+                self.predict_sentences_with_profile(warm_sentences)
+            self._prewarmed = True
+            return True

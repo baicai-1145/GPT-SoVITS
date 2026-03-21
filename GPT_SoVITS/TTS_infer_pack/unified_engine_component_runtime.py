@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from collections import deque
@@ -338,6 +339,7 @@ class EngineGpuPrepareTask:
     text_queue_wait_ms: float = 0.0
     ref_spec_queue_wait_ms: float = 0.0
     admission_wait_ms: float = 0.0
+    ref_audio_prepare_future: concurrent.futures.Future | None = None
     phase_one: Dict[str, Any] | None = None
     ref_spec_result: tuple[tuple[Any, Any], Dict[str, float]] | None = None
     state_result: T2SRequestState | None = None

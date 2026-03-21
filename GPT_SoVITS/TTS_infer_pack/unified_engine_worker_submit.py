@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from typing import Any, Dict, List
@@ -271,8 +272,20 @@ class WorkerSubmitLifecycleMixin:
     async def prepare_gpu_audio_phases_async(
         self,
         cpu_stages: List[PreparedCpuStage],
+        prepared_ref_audio_futures: List[concurrent.futures.Future | None] | None = None,
     ) -> List[Dict[str, Any] | Exception]:
-        return await self.prepare_executor.prepare_gpu_audio_phases_async(cpu_stages)
+        return await self.prepare_executor.prepare_gpu_audio_phases_async(
+            cpu_stages,
+            prepared_ref_audio_futures=prepared_ref_audio_futures,
+        )
+
+    def submit_prepare_ref_audio_asset(
+        self,
+        ref_audio_path: str,
+        *,
+        submit_at: float | None = None,
+    ) -> concurrent.futures.Future:
+        return self.prepare_executor.submit_prepare_ref_audio_asset(ref_audio_path, submit_at=submit_at)
 
     async def prepare_gpu_text_phases_async(
         self,

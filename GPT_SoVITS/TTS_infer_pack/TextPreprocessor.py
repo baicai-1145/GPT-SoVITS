@@ -301,33 +301,7 @@ class TextPreprocessor:
 
         normalized_segments = [prepared_segments[index].norm_text for index in zh_indices]
         resolved_segments, g2pw_profile = chinese2.g2p_segments(normalized_segments, return_profile=True)
-        self._accumulate_profile(profile, "g2pw_prepare_ms", g2pw_profile.get("g2pw_prepare_ms", 0.0))
-        self._accumulate_profile(profile, "g2pw_predict_ms", g2pw_profile.get("g2pw_predict_ms", 0.0))
-        self._accumulate_profile(profile, "g2pw_post_ms", g2pw_profile.get("g2pw_post_ms", 0.0))
-        self._accumulate_profile(profile, "g2pw_total_ms", g2pw_profile.get("g2pw_total_ms", 0.0))
-        self._accumulate_profile(profile, "g2pw_runtime_total_ms", g2pw_profile.get("g2pw_runtime_total_ms", 0.0))
-        self._accumulate_profile(profile, "g2pw_runtime_queue_wait_ms", g2pw_profile.get("g2pw_runtime_queue_wait_ms", 0.0))
-        self._accumulate_profile(
-            profile,
-            "g2pw_runtime_collect_wait_ms",
-            g2pw_profile.get("g2pw_runtime_collect_wait_ms", 0.0),
-        )
-        self._accumulate_profile(profile, "g2pw_runtime_run_ms", g2pw_profile.get("g2pw_runtime_run_ms", 0.0))
-        self._update_profile_peak(
-            profile,
-            "g2pw_runtime_batch_rows_peak",
-            g2pw_profile.get("g2pw_runtime_batch_rows", 0.0),
-        )
-        self._update_profile_peak(
-            profile,
-            "g2pw_runtime_batch_requests_peak",
-            g2pw_profile.get("g2pw_runtime_batch_requests", 0.0),
-        )
-        self._update_profile_peak(
-            profile,
-            "g2pw_runtime_pool_workers",
-            g2pw_profile.get("g2pw_runtime_pool_workers", 0.0),
-        )
+        self._merge_g2pw_profile(profile, g2pw_profile)
         for index, (phones, word2ph, norm_text) in zip(zh_indices, resolved_segments):
             prepared_segments[index] = PreparedTextSegment(
                 language=prepared_segments[index].language,
@@ -337,6 +311,53 @@ class TextPreprocessor:
                 needs_g2pw=False,
             )
         return prepared_segments
+
+    def resolve_g2pw_segments_batch(
+        self,
+        prepared_segment_batches: List[List[PreparedTextSegment]],
+        profiles: List[Dict | None] | None = None,
+    ) -> List[List[PreparedTextSegment]]:
+        if not prepared_segment_batches:
+            return prepared_segment_batches
+        zh_indices_batches = [
+            [index for index, segment in enumerate(prepared_segments) if bool(segment.needs_g2pw)]
+            for prepared_segments in prepared_segment_batches
+        ]
+        if not any(zh_indices_batches):
+            return prepared_segment_batches
+        from text import chinese2
+
+        normalized_segment_batches = [
+            [prepared_segments[index].norm_text for index in zh_indices]
+            for prepared_segments, zh_indices in zip(prepared_segment_batches, zh_indices_batches)
+        ]
+        resolved_segment_batches, g2pw_profiles = chinese2.g2p_segments_batch(
+            normalized_segment_batches,
+            return_profiles=True,
+        )
+        resolved_batches: List[List[PreparedTextSegment]] = []
+        if profiles is None:
+            profile_list: List[Dict | None] = [None] * len(prepared_segment_batches)
+        else:
+            profile_list = list(profiles)
+            if len(profile_list) < len(prepared_segment_batches):
+                profile_list.extend([None] * (len(prepared_segment_batches) - len(profile_list)))
+        for batch_index, (prepared_segments, zh_indices, resolved_segments) in enumerate(
+            zip(prepared_segment_batches, zh_indices_batches, resolved_segment_batches)
+        ):
+            batch_profile = g2pw_profiles[batch_index]
+            self._merge_g2pw_profile(profile_list[batch_index], batch_profile)
+            batch_result = list(prepared_segments)
+            for index, (phones, word2ph, norm_text) in zip(zh_indices, resolved_segments):
+                batch_result[index] = PreparedTextSegment(
+                    language=batch_result[index].language,
+                    phones=list(cleaned_text_to_sequence(phones, self.version)),
+                    word2ph=None if word2ph is None else list(word2ph),
+                    norm_text=str(norm_text),
+                    needs_g2pw=False,
+                )
+            resolved_batches.append(batch_result)
+        return resolved_batches
 
     def build_phones_and_bert_from_segments(
         self,
@@ -372,6 +393,35 @@ class TextPreprocessor:
         if profile is None:
             return
         profile[key] = float(max(float(profile.get(key, 0.0)), float(value)))
+
+    def _merge_g2pw_profile(self, profile: Dict | None, g2pw_profile: Dict[str, float]) -> None:
+        self._accumulate_profile(profile, "g2pw_prepare_ms", g2pw_profile.get("g2pw_prepare_ms", 0.0))
+        self._accumulate_profile(profile, "g2pw_predict_ms", g2pw_profile.get("g2pw_predict_ms", 0.0))
+        self._accumulate_profile(profile, "g2pw_post_ms", g2pw_profile.get("g2pw_post_ms", 0.0))
+        self._accumulate_profile(profile, "g2pw_total_ms", g2pw_profile.get("g2pw_total_ms", 0.0))
+        self._accumulate_profile(profile, "g2pw_runtime_total_ms", g2pw_profile.get("g2pw_runtime_total_ms", 0.0))
+        self._accumulate_profile(profile, "g2pw_runtime_queue_wait_ms", g2pw_profile.get("g2pw_runtime_queue_wait_ms", 0.0))
+        self._accumulate_profile(
+            profile,
+            "g2pw_runtime_collect_wait_ms",
+            g2pw_profile.get("g2pw_runtime_collect_wait_ms", 0.0),
+        )
+        self._accumulate_profile(profile, "g2pw_runtime_run_ms", g2pw_profile.get("g2pw_runtime_run_ms", 0.0))
+        self._update_profile_peak(
+            profile,
+            "g2pw_runtime_batch_rows_peak",
+            g2pw_profile.get("g2pw_runtime_batch_rows", 0.0),
+        )
+        self._update_profile_peak(
+            profile,
+            "g2pw_runtime_batch_requests_peak",
+            g2pw_profile.get("g2pw_runtime_batch_requests", 0.0),
+        )
+        self._update_profile_peak(
+            profile,
+            "g2pw_runtime_pool_workers",
+            g2pw_profile.get("g2pw_runtime_pool_workers", 0.0),
+        )
 
     def _merge_bert_worker_profile(self, profile: Dict | None, worker_profile: Dict[str, float]) -> None:
         self._accumulate_profile(profile, "bert_wait_ms", worker_profile.get("bert_wait_ms", 0.0))

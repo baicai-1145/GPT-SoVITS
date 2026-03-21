@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import time
+from typing import Dict, List, Sequence, Tuple
 
 import cn2an
 from pypinyin import lazy_pinyin, Style
@@ -65,6 +66,8 @@ _PUNCTUATIONS_PATTERN = re.compile(f"([{_PUNCTUATION_CHARS}])([{_PUNCTUATION_CHA
 
 tone_modifier = ToneSandhi()
 _THREAD_LOCAL = threading.local()
+_G2PW_PIPELINE_PREWARM_LOCK = threading.Lock()
+_G2PW_PIPELINE_PREWARMED = False
 
 
 def _get_text_normalizer() -> TextNormalizer:
@@ -113,6 +116,158 @@ def _prepare_g2p_segments(segments):
         if processed_segment:
             batch_inputs.append(processed_segment)
     return prepared_segments, batch_inputs
+
+
+def _new_g2pw_profile() -> Dict[str, float]:
+    return {
+        "g2pw_prepare_ms": 0.0,
+        "g2pw_predict_ms": 0.0,
+        "g2pw_post_ms": 0.0,
+        "g2pw_total_ms": 0.0,
+        "g2pw_runtime_total_ms": 0.0,
+        "g2pw_runtime_queue_wait_ms": 0.0,
+        "g2pw_runtime_collect_wait_ms": 0.0,
+        "g2pw_runtime_run_ms": 0.0,
+        "g2pw_runtime_batch_rows": 0.0,
+        "g2pw_runtime_batch_requests": 0.0,
+        "g2pw_runtime_pool_workers": 0.0,
+        "g2pw_runtime_shard_index": 0.0,
+    }
+
+
+def _predict_g2pw_batch(batch_inputs: Sequence[str]) -> Tuple[List[List[str]], Dict[str, float]]:
+    profile = _new_g2pw_profile()
+    if not (is_g2pw and batch_inputs):
+        return [], profile
+    converter = g2pw._g2pw
+    if hasattr(converter, "predict_sentences_with_profile"):
+        g2pw_batch_results, predict_profile = converter.predict_sentences_with_profile(list(batch_inputs))
+        for key, value in dict(predict_profile or {}).items():
+            profile[key] = float(value)
+        return g2pw_batch_results, profile
+    predict_start = time.perf_counter()
+    g2pw_batch_results = converter(list(batch_inputs))
+    profile["g2pw_predict_ms"] = float((time.perf_counter() - predict_start) * 1000.0)
+    return g2pw_batch_results, profile
+
+
+def _g2pw_batch_weight(prepared_segments, batch_inputs: Sequence[str]) -> float:
+    char_count = sum(len(item["segment"]) for item in prepared_segments if item["segment"])
+    if char_count > 0:
+        return float(char_count)
+    if batch_inputs:
+        return float(len(batch_inputs))
+    return 0.0
+
+
+def _merge_shared_g2pw_profile(
+    profile: Dict[str, float],
+    shared_profile: Dict[str, float],
+    weight: float,
+    total_weight: float,
+) -> None:
+    if total_weight <= 0.0 or weight <= 0.0:
+        return
+    scale = float(weight) / float(total_weight)
+    for key in (
+        "g2pw_predict_ms",
+        "g2pw_runtime_total_ms",
+        "g2pw_runtime_queue_wait_ms",
+        "g2pw_runtime_collect_wait_ms",
+        "g2pw_runtime_run_ms",
+    ):
+        profile[key] = float(profile.get(key, 0.0)) + float(shared_profile.get(key, 0.0)) * scale
+    for key in (
+        "g2pw_runtime_batch_rows",
+        "g2pw_runtime_batch_requests",
+        "g2pw_runtime_pool_workers",
+        "g2pw_runtime_shard_index",
+    ):
+        profile[key] = float(shared_profile.get(key, 0.0))
+
+
+def g2p_segments_batch(
+    segment_batches: Sequence[Sequence[str]],
+    return_profiles: bool = False,
+):
+    prepared_batches = []
+    all_batch_inputs: List[str] = []
+    batch_weights: List[float] = []
+    for segments in segment_batches:
+        prepare_start = time.perf_counter()
+        prepared_segments, batch_inputs = _prepare_g2p_segments(list(segments))
+        profile = _new_g2pw_profile()
+        profile["g2pw_prepare_ms"] = float((time.perf_counter() - prepare_start) * 1000.0)
+        prepared_batches.append(
+            {
+                "prepared_segments": prepared_segments,
+                "batch_inputs": batch_inputs,
+                "profile": profile,
+            }
+        )
+        all_batch_inputs.extend(batch_inputs)
+        batch_weights.append(_g2pw_batch_weight(prepared_segments, batch_inputs))
+
+    g2pw_batch_results, shared_profile = _predict_g2pw_batch(all_batch_inputs)
+    total_weight = float(sum(batch_weights))
+    results_batches = []
+    batch_cursor = 0
+    for batch_info, batch_weight in zip(prepared_batches, batch_weights):
+        profile = batch_info["profile"]
+        batch_inputs = batch_info["batch_inputs"]
+        if batch_inputs:
+            _merge_shared_g2pw_profile(profile, shared_profile, batch_weight, total_weight)
+        post_start = time.perf_counter()
+        results = []
+        for item in batch_info["prepared_segments"]:
+            segment = item["segment"]
+            if not segment:
+                results.append(([], [], segment))
+                continue
+            if not is_g2pw:
+                phones, word2ph = _build_segment_without_g2pw(segment, item["seg_cut"])
+                results.append((phones, word2ph, segment))
+                continue
+            pinyins = g2pw_batch_results[batch_cursor]
+            batch_cursor += 1
+            phones, word2ph = _build_segment_from_g2pw(segment, item["seg_cut"], pinyins)
+            results.append((phones, word2ph, segment))
+        profile["g2pw_post_ms"] = float((time.perf_counter() - post_start) * 1000.0)
+        profile["g2pw_total_ms"] = float(
+            profile["g2pw_prepare_ms"] + profile["g2pw_predict_ms"] + profile["g2pw_post_ms"]
+        )
+        results_batches.append(results)
+    if return_profiles:
+        return results_batches, [dict(batch_info["profile"]) for batch_info in prepared_batches]
+    return results_batches
+
+
+def prewarm_g2pw_pipeline(sentences: Sequence[str] | None = None, rounds: int = 1) -> bool:
+    global _G2PW_PIPELINE_PREWARMED
+    if not is_g2pw:
+        return False
+    with _G2PW_PIPELINE_PREWARM_LOCK:
+        if _G2PW_PIPELINE_PREWARMED:
+            return False
+        warm_sentences = list(
+            sentences
+            or [
+                "重庆银行的行长在长安见到了重要的人。",
+                "音乐老师重新调整了长句里的重音和节奏。",
+                "我们准备把参考文本和目标文本一起处理。",
+                "这个系统需要在高并发下稳定完成预处理。",
+            ]
+        )
+        warm_sentences = [str(item).strip() for item in warm_sentences if str(item).strip()]
+        if not warm_sentences:
+            warm_sentences = ["重庆银行的行长在长安见到了重要的人。"]
+        warm_rounds = max(1, int(rounds))
+        warm_batches = [warm_sentences, list(reversed(warm_sentences))]
+        for _ in range(warm_rounds):
+            for batch in warm_batches:
+                g2p_segments_batch([batch], return_profiles=False)
+        _G2PW_PIPELINE_PREWARMED = True
+        return True
 
 
 def _build_segment_from_g2pw(segment: str, seg_cut, pinyins):
@@ -245,52 +400,9 @@ def _build_segment_without_g2pw(segment: str, seg_cut):
 
 
 def g2p_segments(segments, return_profile: bool = False):
-    prepare_start = time.perf_counter()
-    prepared_segments, batch_inputs = _prepare_g2p_segments(segments)
-    profile = {
-        "g2pw_prepare_ms": 0.0,
-        "g2pw_predict_ms": 0.0,
-        "g2pw_post_ms": 0.0,
-        "g2pw_runtime_total_ms": 0.0,
-        "g2pw_runtime_queue_wait_ms": 0.0,
-        "g2pw_runtime_collect_wait_ms": 0.0,
-        "g2pw_runtime_run_ms": 0.0,
-        "g2pw_runtime_batch_rows": 0.0,
-        "g2pw_runtime_batch_requests": 0.0,
-        "g2pw_runtime_pool_workers": 0.0,
-        "g2pw_runtime_shard_index": 0.0,
-    }
-    profile["g2pw_prepare_ms"] = float((time.perf_counter() - prepare_start) * 1000.0)
-    if is_g2pw and batch_inputs:
-        converter = g2pw._g2pw
-        if hasattr(converter, "predict_sentences_with_profile"):
-            g2pw_batch_results, predict_profile = converter.predict_sentences_with_profile(batch_inputs)
-            for key, value in dict(predict_profile or {}).items():
-                profile[key] = float(value)
-        else:
-            predict_start = time.perf_counter()
-            g2pw_batch_results = converter(batch_inputs)
-            profile["g2pw_predict_ms"] = float((time.perf_counter() - predict_start) * 1000.0)
-    else:
-        g2pw_batch_results = []
-    post_start = time.perf_counter()
-    results = []
-    batch_cursor = 0
-    for item in prepared_segments:
-        segment = item["segment"]
-        if not segment:
-            results.append(([], [], segment))
-            continue
-        if not is_g2pw:
-            phones, word2ph = _build_segment_without_g2pw(segment, item["seg_cut"])
-            results.append((phones, word2ph, segment))
-            continue
-        pinyins = g2pw_batch_results[batch_cursor]
-        batch_cursor += 1
-        phones, word2ph = _build_segment_from_g2pw(segment, item["seg_cut"], pinyins)
-        results.append((phones, word2ph, segment))
-    profile["g2pw_post_ms"] = float((time.perf_counter() - post_start) * 1000.0)
-    profile["g2pw_total_ms"] = float(profile["g2pw_prepare_ms"] + profile["g2pw_predict_ms"] + profile["g2pw_post_ms"])
+    results_batches, profile_batches = g2p_segments_batch([segments], return_profiles=True)
+    results = results_batches[0]
+    profile = profile_batches[0]
     if return_profile:
         return results, profile
     return results

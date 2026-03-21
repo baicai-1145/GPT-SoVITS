@@ -44,6 +44,7 @@ from TTS_infer_pack.prepare_ref_semantic_batch_worker import (
     PrepareRefSemanticBatchWorkerPool,
     prepare_prompt_semantic_wav16k,
 )
+from TTS_infer_pack.prepare_g2pw_batch_worker import PrepareG2PWBatchWorker, PrepareG2PWBatchWorkerPool
 from TTS_infer_pack.prepare_text_cpu_worker import PrepareTextCpuWorker
 from sv import SV
 
@@ -458,6 +459,7 @@ class TTS:
         self.prepare_ref_audio_cpu_limiter = StageLimiter(int(os.environ.get("GPTSOVITS_PREPARE_REF_CPU_SLOTS", "8")))
         self.prepare_bert_batch_worker = None
         self.prepare_ref_semantic_batch_worker = None
+        self.prepare_g2pw_batch_worker = None
         self.prepare_text_cpu_worker = None
         # Default on: request-local text CPU preprocessing blocks the event loop and serializes
         # prepare_cpu_stage under high concurrency. A single worker with a large high-pressure
@@ -489,6 +491,7 @@ class TTS:
     def refresh_runtime_components(self):
         self.prepare_bert_batch_worker = None
         self.prepare_ref_semantic_batch_worker = None
+        self.prepare_g2pw_batch_worker = None
         self.prepare_text_cpu_worker = None
         if os.environ.get("GPTSOVITS_PREPARE_BERT_BATCHING", "1") != "0":
             bert_worker_kwargs = dict(
@@ -549,6 +552,41 @@ class TTS:
             bert_stage_limiter=self.prepare_bert_stage_limiter,
             bert_batch_worker=self.prepare_bert_batch_worker,
         )
+        # Default off: a request-level g2pw super-batch increases per-request wall time because
+        # g2pw prepare/post work still scales roughly with group count, even if predict is shared.
+        if os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCHING", "0") != "0":
+            g2pw_worker_kwargs = dict(
+                resolve_batch_fn=self.text_preprocessor.resolve_g2pw_segments_batch,
+                batch_window_ms=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_WINDOW_MS", "2")),
+                max_batch_tasks=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_MAX_TASKS", "64")),
+                max_batch_groups=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_MAX_GROUPS", "128")),
+                max_batch_chars=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_MAX_CHARS", "4096")),
+                max_pending_tasks=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_MAX_PENDING_TASKS", "0")),
+                admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_G2PW_ADMISSION_POLL_MS", "1")),
+                high_pressure_pending_threshold=int(
+                    os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_PENDING_THRESHOLD", "32")
+                ),
+                high_pressure_batch_window_ms=int(
+                    os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_BATCH_WINDOW_MS", "4")
+                ),
+                high_pressure_max_batch_tasks=int(
+                    os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_TASKS", "128")
+                ),
+                high_pressure_max_batch_groups=int(
+                    os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_GROUPS", "256")
+                ),
+                high_pressure_max_batch_chars=int(
+                    os.environ.get("GPTSOVITS_PREPARE_G2PW_HIGH_PRESSURE_MAX_CHARS", "8192")
+                ),
+            )
+            g2pw_batch_workers = max(1, int(os.environ.get("GPTSOVITS_PREPARE_G2PW_BATCH_WORKERS", "2")))
+            if g2pw_batch_workers > 1:
+                self.prepare_g2pw_batch_worker = PrepareG2PWBatchWorkerPool(
+                    worker_count=int(g2pw_batch_workers),
+                    **g2pw_worker_kwargs,
+                )
+            else:
+                self.prepare_g2pw_batch_worker = PrepareG2PWBatchWorker(**g2pw_worker_kwargs)
         if self.prepare_text_cpu_workers > 0:
             self.prepare_text_cpu_worker = PrepareTextCpuWorker(
                 process_fn=lambda text, language: self.text_preprocessor.preprocess_text_segments(
@@ -576,6 +614,28 @@ class TTS:
                 admission_poll_ms=int(os.environ.get("GPTSOVITS_PREPARE_TEXT_CPU_ADMISSION_POLL_MS", "1")),
                 admission_controller=self._build_text_cpu_admission_state,
             )
+        self._prewarm_g2pw_runtime()
+
+    def _prewarm_g2pw_runtime(self) -> None:
+        if os.environ.get("GPTSOVITS_G2PW_CUDA_PREWARM", "1") == "0":
+            return
+        warm_rounds = max(1, int(os.environ.get("GPTSOVITS_G2PW_CUDA_PREWARM_ROUNDS", "1")))
+        warm_texts_env = os.environ.get("GPTSOVITS_G2PW_CUDA_PREWARM_TEXTS", "").strip()
+        warm_texts = [item.strip() for item in warm_texts_env.split("|") if item.strip()] if warm_texts_env else None
+        try:
+            from text import chinese2
+
+            pipeline_prewarmed = False
+            if hasattr(chinese2, "prewarm_g2pw_pipeline"):
+                pipeline_prewarmed = bool(
+                    chinese2.prewarm_g2pw_pipeline(sentences=warm_texts, rounds=warm_rounds)
+                )
+            if not pipeline_prewarmed:
+                g2pw_instance = getattr(chinese2, "g2pw", None)
+                if g2pw_instance is not None and hasattr(g2pw_instance, "prewarm"):
+                    g2pw_instance.prewarm(sentences=warm_texts, rounds=warm_rounds)
+        except Exception:
+            pass
 
     @staticmethod
     def _safe_queue_qsize(executor) -> int | None:
@@ -630,6 +690,9 @@ class TTS:
                 None if self.text_preprocessor is None or not hasattr(self.text_preprocessor, "snapshot") else self.text_preprocessor.snapshot()
             ),
             "g2pw": g2pw_runtime,
+            "g2pw_batch": (
+                None if self.prepare_g2pw_batch_worker is None else dict(self.prepare_g2pw_batch_worker.snapshot())
+            ),
         }
 
     def _build_text_cpu_admission_state(self) -> dict:
@@ -1436,6 +1499,9 @@ class TTS:
 
     def resolve_g2pw_segments(self, prepared_segments, profile: dict | None = None):
         return self.text_preprocessor.resolve_g2pw_segments(prepared_segments, profile=profile)
+
+    def resolve_g2pw_segments_batch(self, prepared_segment_batches, profiles: list[dict | None] | None = None):
+        return self.text_preprocessor.resolve_g2pw_segments_batch(prepared_segment_batches, profiles=profiles)
 
     def build_text_features_from_segments(self, prepared_segments, profile: dict | None = None):
         return self.text_preprocessor.build_phones_and_bert_from_segments(prepared_segments, profile=profile)
